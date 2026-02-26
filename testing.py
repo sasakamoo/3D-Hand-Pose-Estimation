@@ -61,9 +61,12 @@ class FreiHAND_Dataset(Dataset):
         else:
             img_name = os.path.join(self.root, "FreiHAND_pub_v2/training/rgb/", f"{idx:0{8}d}.jpg")
 
-        img = io.read_image(img_name)
-
-        return img
+        feature = io.decode_image(img_name)
+        points = torch.tensor(self.points[idx])
+        K = torch.tensor(self.K[idx])
+        scale = torch.tensor(self.scale[idx])
+        label = {'Points': points, 'K': K, 'Scale': scale}
+        return feature, label
 
 def train(args, model, device, train_loader, optimizer, epoch):
     model.train()
@@ -106,6 +109,24 @@ class Net(nn.Module):
 
     def forward(self, x):
         return x
+
+def projectPoints(xyz, K):     
+    xyz = np.array(xyz)     
+    K = np.array(K)     
+    uv = np.matmul(K, xyz.T).T     
+    return uv[:, :2] / uv[:, -1:]
+
+def plot_hand(points):
+    cmap = {
+        "thumb": {"idx": [0, 1, 2, 3, 4], "color": 'r'},
+        "index": {"idx": [0, 5, 6, 7, 8], "color": 'm'},
+        "middle": {"idx": [0, 9, 10, 11, 12], "color": 'b'},
+        "ring": {"idx": [0, 13, 14, 15, 16], "color": 'c'},
+        "little": {"idx": [0, 17, 18, 19, 20], "color": 'g'}
+    }
+
+    for finger, params in cmap.items():
+        plt.plot(points[params["idx"], 0], points[params["idx"], 1], params["color"])
 
 def main():
     # Training settings
@@ -156,11 +177,17 @@ def main():
     training_loader = torch.utils.data.DataLoader(training_dataset,**train_kwargs)
     testing_loader = torch.utils.data.DataLoader(testing_dataset, **test_kwargs)
 
-    feature_vectors = next(iter(training_loader))
-    img = feature_vectors[0]
-    img_np = img.detach().numpy()
-    img_np = img_np.transpose((1, 2, 0))
-    plt.imshow(img_np)
+    i = 0
+    features, labels = next(iter(training_loader))
+    feature = features[i]
+    points = labels['Points'][i]
+    K = labels['K'][i]
+    scale = labels['Scale'][i]
+    imgPoints = projectPoints(points.tolist(), K.tolist()) 
+    img = feature.detach().numpy()
+    img = img.transpose((1, 2, 0))
+    plt.imshow(img)
+    plot_hand(imgPoints)
     plt.show()
     return
     model = Net().to(device)
