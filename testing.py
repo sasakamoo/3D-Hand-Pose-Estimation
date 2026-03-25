@@ -60,7 +60,7 @@ class FreiHAND_Dataset(Dataset):
         else:
             img_name = os.path.join(self.root, "FreiHAND_pub_v2/training/rgb/", f"{idx:0{8}d}.jpg")
 
-        feature = io.decode_image(img_name).to(torch.float32)
+        feature = io.read_image(img_name).to(torch.float32) / 255.0
         points = torch.tensor(self.points[idx])
         K = torch.tensor(self.K[idx])
         scale = torch.tensor(self.scale[idx])
@@ -171,7 +171,7 @@ class UNet(nn.Module):
 
 def main():
     # Training settings
-    parser = argparse.ArgumentParser(description='PyTorch MNIST Example')
+    parser = argparse.ArgumentParser(description='3D Hand Pose Estimation')
     parser.add_argument('--batch-size', type=int, default=32, metavar='N',
                         help='input batch size for training (default: 32)')
     parser.add_argument('--test-batch-size', type=int, default=32, metavar='N',
@@ -192,7 +192,11 @@ def main():
                         help='how many batches to wait before logging training status')
     parser.add_argument('--save-model', action='store_true', 
                         help='For Saving the current Model')
+    parser.add_argument('--test', action='store_true',
+                        help='Test saved model')
     args = parser.parse_args()
+
+    print(args)
 
     use_accel = not args.no_accel and torch.accelerator.is_available()
 
@@ -218,31 +222,51 @@ def main():
     training_loader = torch.utils.data.DataLoader(training_dataset,**train_kwargs)
     testing_loader = torch.utils.data.DataLoader(testing_dataset, **test_kwargs)
 
-
-    #features, labels = next(iter(training_loader))
-    #for i in range (0, len(features)):
-    #    feature = features[i]
-    #    points = labels['Points'][i]
-    #    K = labels['K'][i]
-    #    scale = labels['Scale'][i]
-    #    imgPoints = projectPoints(points, K) 
-    #    img = feature.detach().numpy()
-    #    img = img.transpose((1, 2, 0))
-    #    plt.imshow(img)
-    #    plot_hand(imgPoints)
-    #    plt.show()
-    #return
     model = UNet(3, 21, 16).to(device)
     optimizer = optim.Adadelta(model.parameters(), lr=args.lr)
 
     scheduler = StepLR(optimizer, step_size=1, gamma=args.gamma)
-    for epoch in range(1, args.epochs + 1):
-        train(args, model, device, training_loader, optimizer, epoch)
-        test(model, device, testing_loader)
-        scheduler.step()
 
-    if args.save_model:
-        torch.save(model.state_dict(), "mnist_cnn.pt")
+    if args.test:
+        state_dict = torch.load('unetcnn.pt', map_location="cuda:0", weights_only=True)
+        model.load_state_dict(state_dict)
+        model.to(device)
+        model.eval()
+        features, labels = next(iter(training_loader))
+        for i in range (0, len(features)):
+            feature = features[i]
+            points = labels['Points'][i]
+            K = labels['K'][i]
+            scale = labels['Scale'][i]
+            imgPoints = projectPoints(points, K) 
+            img = feature * 255
+            img = img.to(torch.uint8)
+            img = img.detach().numpy().transpose(1, 2, 0)
+            
+            plt.subplot(1, 2, 1)
+            plt.imshow(img)
+            plot_hand(imgPoints)
+            gpuFeatures = features.to(device)
+            predictedPoints = model(gpuFeatures)
+            predictedPoints = predictedPoints.to('cpu')
+
+            predictedImgPoints = projectPoints(predictedPoints[i], K)
+
+            plt.subplot(1, 2, 2)
+            plt.imshow(img)
+            plot_hand(predictedImgPoints.detach().numpy())
+
+            plt.tight_layout()
+            plt.show()
+
+    else:
+        for epoch in range(1, args.epochs + 1):
+            train(args, model, device, training_loader, optimizer, epoch)
+            test(model, device, testing_loader)
+            scheduler.step()
+
+        if args.save_model:
+            torch.save(model.state_dict(), "unetcnn.pt")
 
 
 if __name__ == '__main__':
