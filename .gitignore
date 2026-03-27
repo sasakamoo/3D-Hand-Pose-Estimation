@@ -1,2 +1,2 @@
 .venv
-*.code-workspace
+*.code-workspace*.pt
