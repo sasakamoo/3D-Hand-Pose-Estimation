@@ -60,7 +60,7 @@ class FreiHANDDataset(Dataset):
         self.split   = split
         self.augment = augment
 
-        base_dir = os.path.join(root, 'FreiHAND_pub_v2')
+        base_dir = os.path.join(root)
         with open(os.path.join(base_dir, 'training_K.json'))     as f: self.Ks     = json.load(f)
         with open(os.path.join(base_dir, 'training_scale.json')) as f: self.scales = json.load(f)
         with open(os.path.join(base_dir, 'training_xyz.json'))   as f: self.xyzs   = json.load(f)
@@ -185,6 +185,15 @@ class FreiHANDDataset(Dataset):
         img    = cv2.warpAffine(img, M_rot, (W, H), borderMode=cv2.BORDER_REFLECT)
         uv_h   = np.hstack([uv, np.ones((uv.shape[0], 1))])
         uv     = (M_rot @ uv_h.T).T
+
+        # Adjust K principal point for rotation.
+        # fx, fy are physical focal lengths — unaffected by in-plane rotation.
+        # cx, cy are pixel coords of the optical axis; they shift when the image
+        # is rotated around a centre that doesn't coincide with the principal point.
+        pp = np.array([K[0, 2], K[1, 2]])
+        pp_new = M_rot[:, :2] @ pp + M_rot[:, 2]
+        K[0, 2] = pp_new[0]
+        K[1, 2] = pp_new[1]
 
         # Clip to image boundaries
         uv[:, 0] = np.clip(uv[:, 0], 0, W - 1)

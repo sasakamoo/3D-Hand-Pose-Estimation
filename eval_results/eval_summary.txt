@@ -1,0 +1,45 @@
+Model      : ./best_model.pt
+Epoch      : epoch 99
+Split      : val
+N samples  : 3256
+
+--- 2D ---
+MEPE-2D         : 2.899 px
+PCK-2D @  2px   : 57.61 %
+PCK-2D @  5px   : 89.34 %
+PCK-2D @ 10px   : 97.41 %
+PCK-2D @ 15px   : 99.19 %
+AUC-2D (0-30px) : 0.9034
+
+--- 3D ---
+MPJPE           : 0.1538
+PA-MPJPE        : 0.0877
+PCK-3D @ 0.05   : 15.83 %
+PCK-3D @ 0.10   : 41.98 %
+PCK-3D @ 0.20   : 76.86 %
+AUC-3D (0-0.5)  : 0.7038
+AUC-3D PA(0-0.5): 0.8258
+Bone-length err : 0.0282
+
+--- Per-joint 3D error ---
+   0 Wrist        : 0.0000
+   1 Idx-MCP      : 0.0699
+   2 Idx-PIP      : 0.1150
+   3 Idx-DIP      : 0.1541
+   4 Idx-Tip      : 0.2280
+   5 Mid-MCP      : 0.1076
+   6 Mid-PIP      : 0.1411
+   7 Mid-DIP      : 0.1712
+   8 Mid-Tip      : 0.2271
+   9 Rng-MCP      : 0.1145
+  10 Rng-PIP      : 0.1489
+  11 Rng-DIP      : 0.1782
+  12 Rng-Tip      : 0.2317
+  13 Pnk-MCP      : 0.1167
+  14 Pnk-PIP      : 0.1462
+  15 Pnk-DIP      : 0.1773
+  16 Pnk-Tip      : 0.2263
+  17 Thm-CMC      : 0.1227
+  18 Thm-MCP      : 0.1503
+  19 Thm-IP       : 0.1789
+  20 Thm-Tip      : 0.2247

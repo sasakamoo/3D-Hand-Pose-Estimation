@@ -1,13 +1,21 @@
 """
-visualize.py — Visualize model predictions
-==========================================
-Shows:
-  1. 2D skeleton overlaid on image (predicted vs GT)
-  2. 3D skeleton in normalised space (predicted vs GT)
-  3. Error table per joint
+visualize.py — Evaluate and visualize model predictions on dataset samples
+===========================================================================
+For each sample:
+  1. Saves a 2D skeleton PNG (predicted in green, GT in orange) overlaid on image
+  2. Saves Open3D .ply files (joints + skeleton) for 3D inspection
+
+Usage:
+    python3 visualize.py --model best_model.pt --data-root /path/to/FreiHAND
+    python3 visualize.py --model best_model.pt --data-root /path/to/FreiHAND --n-samples 16
+    python3 visualize.py --model best_model.pt --data-root /path/to/FreiHAND --split train
+
+After running:
+    python3 view_3d.py --sample 0     # interactive 3D viewer
 """
 
 import argparse
+import os
 from pathlib import Path
 import numpy as np
 import cv2
@@ -27,122 +35,252 @@ CONNECTIONS = [
     [0,17],[17,18],[18,19],[19,20],
 ]
 
+# Per-joint colors (float RGB [0,1]), one per finger
+JOINT_COLORS_NP = np.array([
+    [0.8, 0.8, 0.8],   # 0  wrist     — grey
+    [0.0, 0.9, 0.0],   # 1  index
+    [0.0, 0.9, 0.0],   # 2
+    [0.0, 0.9, 0.0],   # 3
+    [0.0, 0.9, 0.0],   # 4
+    [0.0, 0.5, 1.0],   # 5  middle
+    [0.0, 0.5, 1.0],   # 6
+    [0.0, 0.5, 1.0],   # 7
+    [0.0, 0.5, 1.0],   # 8
+    [1.0, 0.8, 0.0],   # 9  ring
+    [1.0, 0.8, 0.0],   # 10
+    [1.0, 0.8, 0.0],   # 11
+    [1.0, 0.8, 0.0],   # 12
+    [1.0, 0.4, 0.0],   # 13 pinky
+    [1.0, 0.4, 0.0],   # 14
+    [1.0, 0.4, 0.0],   # 15
+    [1.0, 0.4, 0.0],   # 16
+    [0.9, 0.0, 0.9],   # 17 thumb
+    [0.9, 0.0, 0.9],   # 18
+    [0.9, 0.0, 0.9],   # 19
+    [0.6, 0.1, 0.9],   # 20
+], dtype=np.float64)
 
-def draw_skeleton(img, kpts_px, color_bone, color_joint, W, H):
+GT_COLOR = np.array([0.6, 0.6, 0.6], dtype=np.float64)   # grey for GT
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 2D drawing
+# ─────────────────────────────────────────────────────────────────────────────
+
+def draw_skeleton_2d(img, kpts_px, color_bone, color_joint, W, H,
+                     line_thickness=1, joint_radius=2):
     vis = img.copy()
     for s, e in CONNECTIONS:
-        p1 = tuple(np.clip(kpts_px[s].astype(int), [0,0], [W-1,H-1]))
-        p2 = tuple(np.clip(kpts_px[e].astype(int), [0,0], [W-1,H-1]))
-        cv2.line(vis, p1, p2, color_bone, 2)
+        p1 = tuple(np.clip(kpts_px[s].astype(int), [0, 0], [W-1, H-1]))
+        p2 = tuple(np.clip(kpts_px[e].astype(int), [0, 0], [W-1, H-1]))
+        cv2.line(vis, p1, p2, color_bone, line_thickness)
     for pt in kpts_px:
-        c = tuple(np.clip(pt.astype(int), [0,0], [W-1,H-1]))
-        cv2.circle(vis, c, 4, color_joint, -1)
+        c = tuple(np.clip(pt.astype(int), [0, 0], [W-1, H-1]))
+        cv2.circle(vis, c, joint_radius, color_joint, -1)
     return vis
 
 
-def visualize(model_path, data_root, sample_idx, output_dir):
-    output_dir = Path(output_dir); output_dir.mkdir(exist_ok=True)
-    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+# ─────────────────────────────────────────────────────────────────────────────
+# Open3D helpers
+# ─────────────────────────────────────────────────────────────────────────────
 
-    # Load model
-    model = SingleViewModel(num_kpts=21)
-    ckpt  = torch.load(model_path, map_location=device)
-    model.load_state_dict(ckpt['model_state'])
-    model = model.to(device).eval()
-    print(f'✓ Loaded model from {model_path}')
+def make_hand_pcd(joints, colors_per_joint, o3d):
+    pcd = o3d.geometry.PointCloud()
+    pcd.points = o3d.utility.Vector3dVector(joints.astype(np.float64))
+    pcd.colors = o3d.utility.Vector3dVector(colors_per_joint)
+    return pcd
 
-    # Load sample
-    ds = FreiHANDDataset(data_root, split='val', augment=False)
-    batch = ds[sample_idx % len(ds)]
 
-    img_t   = batch['image'].unsqueeze(0).to(device)
-    gt_2d   = batch['pose_2d_gt'].numpy()       # (K, 2) pixels in 128x128
-    gt_z    = batch['depth_rel_gt'].numpy()     # (K,)
-    K_mat   = batch['K_mat'].numpy()            # (3, 3)
+def make_hand_lineset(joints, connections, color, o3d):
+    ls = o3d.geometry.LineSet()
+    ls.points = o3d.utility.Vector3dVector(joints.astype(np.float64))
+    ls.lines  = o3d.utility.Vector2iVector(np.array(connections, dtype=np.int32))
+    if isinstance(color, np.ndarray) and color.ndim == 1:
+        color = np.tile(color, (len(connections), 1))
+    ls.colors = o3d.utility.Vector3dVector(np.array(color, dtype=np.float64))
+    return ls
 
-    with torch.no_grad():
-        pred_2d, pred_z, _, hm_probs = model(img_t)
 
-    # pred_2d is already in pixel space (0..127)
-    pred_2d_px = pred_2d[0].cpu().numpy()   # (K, 2)
-    pred_z_np  = pred_z[0].cpu().numpy()    # (K,)
-
-    # ── Reconstruct 3D ────────────────────────────────────────────────────
-    K_t = batch['K_mat'].unsqueeze(0)
-    pose_3d_pred = reconstruct_3d_from_25d(
-        pred_2d, pred_z, K_t.to(device), img_size=IMG_SIZE).cpu().numpy()[0]
-
-    # GT 3D (back-project)
-    gt_z_root = gt_z[0]
-    gt_Z      = gt_z + gt_z_root
-    fx, fy    = K_mat[0,0], K_mat[1,1]
-    cx, cy    = K_mat[0,2], K_mat[1,2]
-    gt_X      = (gt_2d[:,0] - cx) * gt_Z / fx
-    gt_Y      = (gt_2d[:,1] - cy) * gt_Z / fy
-    pose_3d_gt = np.stack([gt_X, gt_Y, gt_Z], axis=1)
-
-    # ── 2D visualisation ─────────────────────────────────────────────────
-    img_np = (batch['image'].permute(1,2,0).numpy() * 255).astype(np.uint8)
-    H, W   = img_np.shape[:2]
-
-    vis_pred = draw_skeleton(img_np, pred_2d_px,    (0,255,0),   (0,0,255), W, H)
-    vis_gt   = draw_skeleton(img_np, gt_2d,         (255,165,0), (255,0,0), W, H)
-
-    fig, axes = plt.subplots(1, 2, figsize=(12, 6))
-    axes[0].imshow(vis_pred); axes[0].set_title('Predicted  (green)'); axes[0].axis('off')
-    axes[1].imshow(vis_gt);   axes[1].set_title('GT  (orange)');        axes[1].axis('off')
-    plt.suptitle(f'Sample {sample_idx} — 2D Projection', fontsize=13)
-    plt.tight_layout()
-    out = output_dir / '2d_vis.png'
-    plt.savefig(str(out), dpi=150, bbox_inches='tight'); plt.close()
-    print(f'✓ 2D vis → {out}')
-
-    # ── 3D visualisation (root-relative) ─────────────────────────────────
-    p3_pred = pose_3d_pred - pose_3d_pred[0]
-    p3_gt   = pose_3d_gt   - pose_3d_gt[0]
-
-    fig = plt.figure(figsize=(14, 6))
-    for col, (pts, title, color) in enumerate([
-        (p3_pred, 'Predicted', 'red'),
-        (p3_gt,   'GT',        'lime'),
-    ]):
-        ax = fig.add_subplot(1, 2, col+1, projection='3d')
-        ax.scatter(pts[:,0], pts[:,1], pts[:,2], c=color, s=60)
-        for s, e in CONNECTIONS:
-            ax.plot(pts[[s,e],0], pts[[s,e],1], pts[[s,e],2],
-                    color='blue' if color=='red' else 'darkorange', lw=1.5)
-        ax.set_title(title, fontsize=12)
-        ax.set_xlabel('X'); ax.set_ylabel('Y'); ax.set_zlabel('Z')
-    plt.suptitle('3D Pose (root-relative, scale-normalised)', fontsize=13)
-    plt.tight_layout()
-    out = output_dir / '3d_vis.png'
-    plt.savefig(str(out), dpi=150, bbox_inches='tight'); plt.close()
-    print(f'✓ 3D vis → {out}')
-
-    # ── Error table ───────────────────────────────────────────────────────
-    print(f'\n{"Jnt":>4} {"Pred_x":>8} {"Pred_y":>8} {"GT_x":>8} {"GT_y":>8} '
-          f'{"2D_err":>8} {"3D_err":>8}')
-    print('-' * 60)
-    errs_2d, errs_3d = [], []
-    for k in range(21):
-        e2 = np.linalg.norm(pred_2d_px[k] - gt_2d[k])
-        e3 = np.linalg.norm(p3_pred[k] - p3_gt[k])
-        errs_2d.append(e2); errs_3d.append(e3)
-        print(f'{k:>4} {pred_2d_px[k,0]:>8.2f} {pred_2d_px[k,1]:>8.2f} '
-              f'{gt_2d[k,0]:>8.2f} {gt_2d[k,1]:>8.2f} '
-              f'{e2:>8.3f} {e3:>8.4f}')
-    print(f'\nMean 2D error : {np.mean(errs_2d):.3f} px')
-    print(f'Mean 3D error : {np.mean(errs_3d):.4f} (norm units, C=1 bone)')
-
+# ─────────────────────────────────────────────────────────────────────────────
+# Main
+# ─────────────────────────────────────────────────────────────────────────────
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument('--model',      type=str, required=True)
-    parser.add_argument('--data-root',  type=str, default='/home/kia/Dataset')
-    parser.add_argument('--sample-idx', type=int, default=0)
+    parser.add_argument('--model',      type=str, required=True,
+                        help='Path to checkpoint (best_model.pt)')
+    parser.add_argument('--data-root',  type=str, default='/home/kghasemz/projects/def-vislearn/kghasemz/dataset')
+    parser.add_argument('--split',      type=str, default='val',
+                        choices=['train', 'val'])
+    parser.add_argument('--n-samples',  type=int, default=8,
+                        help='How many samples to visualize')
+    parser.add_argument('--start-idx',  type=int, default=0,
+                        help='Dataset index of the first sample')
     parser.add_argument('--output-dir', type=str, default='visualizations')
     args = parser.parse_args()
-    visualize(args.model, args.data_root, args.sample_idx, args.output_dir)
+
+    out_dir = Path(args.output_dir)
+    out_dir.mkdir(parents=True, exist_ok=True)
+    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+
+    # ── Load model ────────────────────────────────────────────────────────
+    model = SingleViewModel(num_kpts=21)
+    ckpt  = torch.load(args.model, map_location=device)
+    model.load_state_dict(ckpt['model_state'])
+    model = model.to(device).eval()
+    print(f'Loaded model from {args.model}')
+    if 'epoch' in ckpt:
+        print(f'  Epoch {ckpt["epoch"]}  |  best MPJPE {ckpt.get("best_mpjpe", "?"):.4f}')
+
+    # ── Dataset ───────────────────────────────────────────────────────────
+    ds = FreiHANDDataset(args.data_root, split=args.split, augment=False)
+    n  = min(args.n_samples, len(ds) - args.start_idx)
+    print(f'\nVisualizing {n} samples from {args.split} split '
+          f'(idx {args.start_idx}–{args.start_idx+n-1})\n')
+
+    errs_2d_all, errs_3d_all = [], []
+    ply_pairs = []   # (joints_path, skeleton_path) per sample
+
+    # ── Try importing open3d once ─────────────────────────────────────────
+    try:
+        import open3d as o3d
+        has_o3d = True
+    except ImportError:
+        has_o3d = False
+        print('  open3d not installed — skipping .ply export')
+        print('  Install with: pip install open3d\n')
+
+    # ── Per-sample loop ───────────────────────────────────────────────────
+    for local_i in range(n):
+        idx   = args.start_idx + local_i
+        batch = ds[idx]
+
+        img_t  = batch['image'].unsqueeze(0).to(device)
+        K_t    = batch['K_mat'].unsqueeze(0).to(device)
+        gt_2d  = batch['pose_2d_gt'].numpy()      # (21, 2) px
+        K_mat  = batch['K_mat'].numpy()           # (3, 3)
+
+        with torch.no_grad():
+            pred_2d, pred_z, _, _ = model(img_t)
+
+        pred_2d_px = pred_2d[0].cpu().numpy()     # (21, 2)
+
+        # 3D reconstruction — same quadratic solve for both pred and GT
+        pose_3d_pred = reconstruct_3d_from_25d(
+            pred_2d, pred_z, K_t, img_size=IMG_SIZE).cpu().numpy()[0]
+
+        gt_2d_t = batch['pose_2d_gt'].unsqueeze(0).to(device)
+        gt_z_t  = batch['depth_rel_gt'].unsqueeze(0).to(device)
+        pose_3d_gt = reconstruct_3d_from_25d(
+            gt_2d_t, gt_z_t, K_t, img_size=IMG_SIZE).cpu().numpy()[0]
+
+        # Root-relative
+        p3 = pose_3d_pred - pose_3d_pred[0]
+        g3 = pose_3d_gt   - pose_3d_gt[0]
+
+        # ── 2D image save ──────────────────────────────────────────────
+        img_np = (batch['image'].permute(1, 2, 0).numpy() * 255).astype(np.uint8)
+        H_im, W_im = img_np.shape[:2]
+
+        vis_pred = draw_skeleton_2d(img_np, pred_2d_px,
+                                    (0, 220, 0), (0, 0, 255),
+                                    W_im, H_im,
+                                    line_thickness=1, joint_radius=2)
+        vis_gt   = draw_skeleton_2d(img_np, gt_2d,
+                                    (255, 140, 0), (220, 0, 0),
+                                    W_im, H_im,
+                                    line_thickness=1, joint_radius=2)
+
+        fig, axes = plt.subplots(1, 2, figsize=(8, 4))
+        axes[0].imshow(vis_pred)
+        axes[0].set_title('Predicted  (green / blue)', fontsize=9)
+        axes[0].axis('off')
+        axes[1].imshow(vis_gt)
+        axes[1].set_title('GT  (orange / red)', fontsize=9)
+        axes[1].axis('off')
+
+        e2d = np.linalg.norm(pred_2d_px - gt_2d, axis=-1).mean()
+        e3d = np.linalg.norm(p3 - g3, axis=-1).mean()
+        errs_2d_all.append(e2d)
+        errs_3d_all.append(e3d)
+
+        plt.suptitle(f'Sample {idx} — 2D err={e2d:.2f}px  3D MPJPE={e3d:.4f}',
+                     fontsize=9)
+        plt.tight_layout()
+        png_path = out_dir / f'2d_sample_{idx:04d}.png'
+        plt.savefig(str(png_path), dpi=150, bbox_inches='tight')
+        plt.close()
+
+        # ── PLY save ───────────────────────────────────────────────────
+        if has_o3d:
+            # Offset GT to the right so both hands are visible in viewer
+            offset = np.array([max(p3[:, 0].max() - g3[:, 0].min() + 0.2, 0.5), 0, 0])
+            g3_off = g3 + offset
+
+            # Save joints as a point cloud PLY (pred 0–20, GT 21–41).
+            # write_line_set to PLY uses a non-standard 'edge' element that
+            # many readers silently ignore — so we only save points here and
+            # reconstruct the LineSet in-memory inside view_3d.py.
+            all_pts    = np.vstack([p3, g3_off])
+            all_colors = np.vstack([JOINT_COLORS_NP,
+                                    np.tile(GT_COLOR, (21, 1))])
+            comb_pcd = o3d.geometry.PointCloud()
+            comb_pcd.points = o3d.utility.Vector3dVector(all_pts)
+            comb_pcd.colors = o3d.utility.Vector3dVector(all_colors)
+
+            pts_path = str(out_dir / f'3d_sample_{idx:04d}.ply')
+            o3d.io.write_point_cloud(pts_path, comb_pcd)
+            ply_pairs.append(pts_path)
+
+        ply_name = f'3d_sample_{idx:04d}.ply'
+        print(f'  [{local_i+1:>2}/{n}]  idx={idx:>5}  '
+              f'2D={e2d:6.2f}px  3D MPJPE={e3d:.4f}  '
+              f'→ {png_path.name}'
+              + (f'  + {ply_name}' if has_o3d else ''))
+
+    # ── Summary ───────────────────────────────────────────────────────────
+    print(f'\nMean 2D error  : {np.mean(errs_2d_all):.3f} px')
+    print(f'Mean 3D MPJPE  : {np.mean(errs_3d_all):.4f}  (norm units, C=1 bone)')
+    print(f'\n2D PNGs saved to  : {out_dir}/')
+    if has_o3d and ply_pairs:
+        print(f'PLY files saved to: {out_dir}/')
+
+    # ── Write view_3d.py convenience viewer ──────────────────────────────
+    if has_o3d and ply_pairs:
+        viewer_path = out_dir / 'view_3d.py'
+        # The skeleton LineSet is rebuilt in-memory from the saved point positions
+        # instead of trying to read it from PLY (write_line_set uses a non-standard
+        # 'edge' element that Open3D and other viewers silently ignore).
+        viewer_lines = [
+            'import argparse, numpy as np, open3d as o3d',
+            'CONNECTIONS = [[0,1],[1,2],[2,3],[3,4],[0,5],[5,6],[6,7],[7,8],',
+            '               [0,9],[9,10],[10,11],[11,12],[0,13],[13,14],[14,15],[15,16],',
+            '               [0,17],[17,18],[18,19],[19,20]]',
+            'parser = argparse.ArgumentParser()',
+            f'parser.add_argument("--sample", type=int, default={args.start_idx})',
+            'args = parser.parse_args()',
+            'i = args.sample',
+            'pcd = o3d.io.read_point_cloud(f"3d_sample_{i:04d}.ply")',
+            'pts = np.asarray(pcd.points)   # (42,3): 0-20=pred, 21-41=GT',
+            'colors = np.asarray(pcd.colors)',
+            '# Rebuild LineSet in-memory — avoids non-standard PLY edge element',
+            'gt_conn = [[s+21, e+21] for s,e in CONNECTIONS]',
+            'all_conn = CONNECTIONS + gt_conn',
+            'bone_colors = [colors[s].tolist() for s,e in CONNECTIONS] + [[0.6,0.6,0.6]]*len(CONNECTIONS)',
+            'ls = o3d.geometry.LineSet()',
+            'ls.points = o3d.utility.Vector3dVector(pts)',
+            'ls.lines  = o3d.utility.Vector2iVector(np.array(all_conn, dtype=np.int32))',
+            'ls.colors = o3d.utility.Vector3dVector(np.array(bone_colors))',
+            'print(f"Sample {i}  |  LEFT=Predicted (coloured)  RIGHT=GT (grey)")',
+            'print("Controls: left-drag=rotate  scroll=zoom  right-drag=pan  Q=quit")',
+            'o3d.visualization.draw_geometries([pcd, ls],',
+            f'    window_name=f"3D Pose — sample {{i}}",',
+            '    width=1024, height=768)',
+        ]
+        with open(str(viewer_path), 'w') as f:
+            f.write('\n'.join(viewer_lines) + '\n')
+        print(f'\nTo view interactively:')
+        print(f'  cd {out_dir} && python3 view_3d.py --sample {args.start_idx}')
 
 
 if __name__ == '__main__':

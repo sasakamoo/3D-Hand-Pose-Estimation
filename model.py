@@ -291,35 +291,47 @@ def reconstruct_3d_from_25d(pose_2d_px: torch.Tensor,
 
     n_idx, m_idx = ref_bone_idx
 
-    # Pixel coords already in [0, img_size] when we pass pose_2d_px * img_size
-    xn = pose_2d_px[:, n_idx, 0]   # (B,)
-    yn = pose_2d_px[:, n_idx, 1]
-    xm = pose_2d_px[:, m_idx, 0]
-    ym = pose_2d_px[:, m_idx, 1]
+    # Unpack intrinsics — needed for both the quadratic and back-projection
+    fx = K_mat[:, 0, 0]  # (B,)
+    fy = K_mat[:, 1, 1]
+    cx = K_mat[:, 0, 2]
+    cy = K_mat[:, 1, 2]
+
+    # Normalised camera coordinates for the reference bone joints.
+    # The bone-length constraint ||P̂_n - P̂_m|| = C applies to 3D points
+    # obtained via perspective back-projection:
+    #   P̂_k = ((x_k - cx)/fx, (y_k - cy)/fy, 1) * Z_k
+    # so the quadratic MUST be expressed in these normalised coords,
+    # NOT in raw pixel values.
+    un = (pose_2d_px[:, n_idx, 0] - cx) / fx   # (B,)
+    vn = (pose_2d_px[:, n_idx, 1] - cy) / fy
+    um = (pose_2d_px[:, m_idx, 0] - cx) / fx
+    vm = (pose_2d_px[:, m_idx, 1] - cy) / fy
     zrn = depth_rel[:, n_idx]
     zrm = depth_rel[:, m_idx]
 
-    # Quadratic coefficients (paper Eq. 6)
-    a = (xn - xm)**2 + (yn - ym)**2
-    b = (zrn * (xn**2 + yn**2 - xn*xm - yn*ym) +
-         zrm * (xm**2 + ym**2 - xn*xm - yn*ym))
-    c = ((xn*zrn - xm*zrm)**2 + (yn*zrn - ym*zrm)**2 +
+    # Quadratic coefficients (paper Eq. 6, using normalised coords).
+    # The linear term of the expanded polynomial is 2*b, so b here is b_full/2.
+    a = (un - um)**2 + (vn - vm)**2
+    b = (zrn * (un**2 + vn**2 - un*um - vn*vm) +
+         zrm * (um**2 + vm**2 - un*um - vn*vm))
+    c = ((un*zrn - um*zrm)**2 + (vn*zrn - vm*zrm)**2 +
          (zrn - zrm)**2 - C**2)
 
-    # Solve for Z_root — take the positive (in-front-of-camera) root
-    discriminant = torch.clamp(b**2 - 4*a*c, min=0.0)
+    # With b = b_full/2 the quadratic is a*Z² + 2b*Z + c = 0, whose solution is:
+    #   Z = (-b ± sqrt(b² - a·c)) / a      (NOT (b² - 4ac) / 2a)
+    discriminant = torch.clamp(b**2 - a*c, min=0.0)
     a_safe = a.clamp(min=1e-8)
-    z_root = (-b + torch.sqrt(discriminant)) / (2 * a_safe)   # (B,)
+    z_root = (-b + torch.sqrt(discriminant)) / a_safe   # (B,)
 
     # Full depth of each keypoint
     Z_k = z_root.unsqueeze(1) + depth_rel        # (B, K)
 
     # Back-project using intrinsics K_mat:  X = (x - cx)*Z / fx,  Y = (y-cy)*Z/fy
-    # K_mat: [[fx, 0, cx], [0, fy, cy], [0, 0, 1]]
-    fx = K_mat[:, 0, 0].unsqueeze(1)  # (B, 1)
-    fy = K_mat[:, 1, 1].unsqueeze(1)
-    cx = K_mat[:, 0, 2].unsqueeze(1)
-    cy = K_mat[:, 1, 2].unsqueeze(1)
+    fx = fx.unsqueeze(1)  # (B, 1)
+    fy = fy.unsqueeze(1)
+    cx = cx.unsqueeze(1)
+    cy = cy.unsqueeze(1)
 
     x_px = pose_2d_px[:, :, 0]   # (B, K)
     y_px = pose_2d_px[:, :, 1]
