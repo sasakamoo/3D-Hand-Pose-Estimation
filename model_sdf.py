@@ -396,6 +396,9 @@ class SDFHandPoseNet(nn.Module):
         pose_2d   : (B, K, 2)    2D pixel coordinates in [0, IMG_SIZE]
         depth_rel : (B, K)       root-relative scale-normalised depth
         sdf_vals  : (B, N_PTS)   per-point signed distance predictions
+        pts       : (B, N_PTS, 3) the query points that produced sdf_vals,
+                    returned so the caller can compute SDF supervision without
+                    re-sampling (sdf_vals[i] corresponds to pts[i]).
         """
         B = x.shape[0]
 
@@ -436,7 +439,7 @@ class SDFHandPoseNet(nn.Module):
         pose_2d   = torch.sigmoid(joint_raw[:, :, :2]) * IMG_SIZE  # (B, K, 2)
         depth_rel = joint_raw[:, :, 2]                              # (B, K)
 
-        return pose_2d, depth_rel, sdf_vals.squeeze(-1)             # last: (B, N)
+        return pose_2d, depth_rel, sdf_vals.squeeze(-1), pts
 
 
 # ── Quick sanity check ────────────────────────────────────────────────────────
@@ -448,7 +451,8 @@ if __name__ == '__main__':
 
     x = torch.randn(2, 3, 128, 128)
     with torch.no_grad():
-        p2d, dz, sdf = net(x)
+        p2d, dz, sdf, pts = net(x)
     print(f'pose_2d   : {p2d.shape}')   # (2, 21, 2)
     print(f'depth_rel : {dz.shape}')    # (2, 21)
     print(f'sdf_vals  : {sdf.shape}')   # (2, 512)
+    print(f'pts       : {pts.shape}')   # (2, 512, 3)
