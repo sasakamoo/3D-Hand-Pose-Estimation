@@ -27,7 +27,7 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 import torch.optim as optim
-from torch.cuda.amp import autocast, GradScaler
+from torch.amp import autocast, GradScaler
 import matplotlib
 matplotlib.use('Agg')
 import matplotlib.pyplot as plt
@@ -131,7 +131,7 @@ def validate(model, loader, device):
         gt_z  = batch['depth_rel_gt'].to(device, non_blocking=True)
         K_mat = batch['K_mat'].to(device, non_blocking=True)
 
-        with autocast():
+        with autocast('cuda'):
             pred_2d, pred_z, _, _ = model(imgs)
 
         pred_3d = reconstruct_3d_from_25d(pred_2d.float(), pred_z.float(),
@@ -244,7 +244,7 @@ def main():
     params = sum(p.numel() for p in model.parameters())
     print(f'Model params: {params:,}  ({params * 4 / 1e6:.1f} MB)\n')
 
-    scaler      = GradScaler(enabled=(device.type == 'cuda'))
+    scaler      = GradScaler('cuda', enabled=(device.type == 'cuda'))
     global_step = (start_epoch - 1) * len(train_loader)
 
     for epoch in range(start_epoch, args.epochs + 1):
@@ -264,7 +264,7 @@ def main():
 
             opt.zero_grad(set_to_none=True)
 
-            with autocast(enabled=(device.type == 'cuda')):
+            with autocast('cuda', enabled=(device.type == 'cuda')):
                 pred_2d, pred_z, sdf_vals, pts = model(imgs)
 
                 loss, lxy, lz, lsdf = loss_full(

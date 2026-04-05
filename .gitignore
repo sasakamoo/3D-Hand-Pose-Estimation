@@ -3,3 +3,5 @@
 *.code-workspace*.pt
 .vscode
 __pycache__/
+
+sdf_best_model.pt
