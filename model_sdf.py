@@ -143,17 +143,29 @@ class ResNetUNet(nn.Module):
         self.layer4 = resnet.layer4     # 2048-ch, /2
 
         # ── Decoder ───────────────────────────────────────────────────────
-        # Each block takes  (upsampled_from_previous, skip_from_encoder).
+        # Skip connections by spatial size (for 128×128 input):
+        #   dec4: up(e4) 4→8,   cat e3  (8×8,  1024ch)
+        #   dec3: up    8→16,   cat e2  (16×16, 512ch)
+        #   dec2: up   16→32,   cat e1  (32×32, 256ch)
+        #   dec1: up   32→64,   cat s0  (64×64,  64ch)  ← s0 = after conv1, before maxpool
+        #   dec0: up   64→128,  no skip  (plain conv to reach input resolution)
         self.dec4 = _dec_block(2048, 1024)      # 4×4   → 8×8
         self.dec3 = _dec_block(FEAT_DIM,  512)  # 8×8   → 16×16
         self.dec2 = _dec_block(FEAT_DIM,  256)  # 16×16 → 32×32
-        self.dec1 = _dec_block(FEAT_DIM,   64)  # 32×32 → 64×64  (pool skip)
-        self.dec0 = _dec_block(FEAT_DIM,   64)  # 64×64 → 128×128 (stem skip)
+        self.dec1 = _dec_block(FEAT_DIM,   64)  # 32×32 → 64×64  (skip: s0)
+        self.dec0 = nn.Sequential(               # 64×64 → 128×128 (no skip)
+            nn.Conv2d(FEAT_DIM, FEAT_DIM, 3, padding=1, bias=False),
+            nn.BatchNorm2d(FEAT_DIM),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(FEAT_DIM, FEAT_DIM, 3, padding=1, bias=False),
+            nn.BatchNorm2d(FEAT_DIM),
+            nn.ReLU(inplace=True),
+        )
 
         self.up = nn.Upsample(scale_factor=2, mode='bilinear', align_corners=False)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        s0 = self.stem(x)           # (B,   64,  64, 64)
+        s0 = self.stem(x)           # (B,   64,  64, 64)  ← skip for dec1
         s1 = self.pool(s0)          # (B,   64,  32, 32)
         e1 = self.layer1(s1)        # (B,  256,  32, 32)
         e2 = self.layer2(e1)        # (B,  512,  16, 16)
@@ -163,8 +175,8 @@ class ResNetUNet(nn.Module):
         d = self.dec4(torch.cat([self.up(e4), e3], dim=1))  # (B, 256,   8,  8)
         d = self.dec3(torch.cat([self.up(d),  e2], dim=1))  # (B, 256,  16, 16)
         d = self.dec2(torch.cat([self.up(d),  e1], dim=1))  # (B, 256,  32, 32)
-        d = self.dec1(torch.cat([self.up(d),  s1], dim=1))  # (B, 256,  64, 64)
-        d = self.dec0(torch.cat([self.up(d),  s0], dim=1))  # (B, 256, 128,128)
+        d = self.dec1(torch.cat([self.up(d),  s0], dim=1))  # (B, 256,  64, 64)
+        d = self.dec0(self.up(d))                            # (B, 256, 128,128)
         return d
 
 
@@ -230,6 +242,7 @@ class JointQueryAttention(nn.Module):
         nn.init.trunc_normal_(self.joint_queries, std=0.02)
 
         # Self-attention stack on point features (paper: 6 MHSA layers)
+        # enable_nested_tensor=False avoids a warning when norm_first=True.
         self.point_encoder = nn.TransformerEncoder(
             nn.TransformerEncoderLayer(
                 d_model=feat_dim,
@@ -240,6 +253,7 @@ class JointQueryAttention(nn.Module):
                 norm_first=True,        # pre-norm for stability
             ),
             num_layers=n_self_layers,
+            enable_nested_tensor=False,
         )
 
         # Cross-attention: joint queries attend to encoded point features
