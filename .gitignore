@@ -2,4 +2,4 @@
 .venv310
 *.code-workspace*.pt
 .vscode
-__pycache__
+__pycache__/
