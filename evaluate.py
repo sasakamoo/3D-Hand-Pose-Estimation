@@ -37,8 +37,9 @@ import matplotlib.pyplot as plt
 from torch.utils.data import DataLoader
 from tqdm import tqdm
 
-from model   import SingleViewModel, reconstruct_3d_from_25d
-from dataset import FreiHANDDataset, IMG_SIZE
+from model     import SingleViewModel, reconstruct_3d_from_25d
+from model_sdf import SDFHandPoseNet
+from dataset   import FreiHANDDataset, IMG_SIZE
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Skeleton / joint metadata
@@ -256,6 +257,9 @@ def plot_pck_curves(thr_2d, pck_2d, auc_2d,
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument('--model',       type=str, required=True)
+    parser.add_argument('--model-type',  type=str, default='heatmap',
+                        choices=['heatmap', 'sdf'],
+                        help='heatmap = SingleViewModel (model.py), sdf = SDFHandPoseNet (model_sdf.py)')
     parser.add_argument('--data-root',   type=str, default='/home/kghasemz/scratch/datasets/FreiHand')
     parser.add_argument('--split',       type=str, default='val',
                         choices=['train', 'val'])
@@ -271,7 +275,10 @@ def main():
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
     # ── Load model ────────────────────────────────────────────────────────
-    model = SingleViewModel(num_kpts=21)
+    if args.model_type == 'sdf':
+        model = SDFHandPoseNet(num_kpts=21, pretrained_backbone=False)
+    else:
+        model = SingleViewModel(num_kpts=21)
     ckpt  = torch.load(args.model, map_location=device)
     model.load_state_dict(ckpt['model_state'])
     model = model.to(device).eval()
