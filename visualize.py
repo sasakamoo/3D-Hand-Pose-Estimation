@@ -142,6 +142,7 @@ def main():
     ply_pairs = []   # (joints_path, skeleton_path) per sample
 
     # ── Try importing open3d once ─────────────────────────────────────────
+    # DOWNLOAD PYTHON 3.10.13 ------ IMPORTANT
     try:
         import open3d as o3d
         has_o3d = True
