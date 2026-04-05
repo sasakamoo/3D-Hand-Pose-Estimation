@@ -27,7 +27,8 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 import torch.optim as optim
-from torch.amp import autocast, GradScaler
+from torch.amp.autocast_mode import autocast
+from torch.amp.grad_scaler import GradScaler
 import matplotlib
 matplotlib.use('Agg')
 import matplotlib.pyplot as plt
