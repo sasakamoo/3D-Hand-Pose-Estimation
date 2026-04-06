@@ -5,3 +5,4 @@
 __pycache__/
 
 sdf_best_model.pt
+sdf_checkpoint.pt
