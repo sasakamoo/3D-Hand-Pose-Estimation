@@ -24,8 +24,9 @@ import matplotlib
 matplotlib.use('Agg')
 import matplotlib.pyplot as plt
 
-from model   import SingleViewModel, reconstruct_3d_from_25d
-from dataset import FreiHANDDataset, IMG_SIZE
+from model     import SingleViewModel, reconstruct_3d_from_25d
+from model_sdf import SDFHandPoseNet
+from dataset   import FreiHANDDataset, IMG_SIZE
 
 CONNECTIONS = [
     [0,1],[1,2],[2,3],[3,4],
@@ -108,7 +109,10 @@ def make_hand_lineset(joints, connections, color, o3d):
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument('--model',      type=str, required=True,
-                        help='Path to checkpoint (best_model.pt)')
+                        help='Path to checkpoint (best_model.pt or sdf_best_model.pt)')
+    parser.add_argument('--model-type', type=str, default='heatmap',
+                        choices=['heatmap', 'sdf'],
+                        help='heatmap = SingleViewModel, sdf = SDFHandPoseNet')
     parser.add_argument('--data-root',  type=str, default='/home/kghasemz/projects/def-vislearn/kghasemz/dataset')
     parser.add_argument('--split',      type=str, default='val',
                         choices=['train', 'val'])
@@ -124,11 +128,14 @@ def main():
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
     # ── Load model ────────────────────────────────────────────────────────
-    model = SingleViewModel(num_kpts=21)
-    ckpt  = torch.load(args.model, map_location=device)
+    if args.model_type == 'sdf':
+        model = SDFHandPoseNet(num_kpts=21, pretrained_backbone=False)
+    else:
+        model = SingleViewModel(num_kpts=21)
+    ckpt  = torch.load(args.model, map_location=device, weights_only=False)
     model.load_state_dict(ckpt['model_state'])
     model = model.to(device).eval()
-    print(f'Loaded model from {args.model}')
+    print(f'Loaded {args.model_type} model from {args.model}')
     if 'epoch' in ckpt:
         print(f'  Epoch {ckpt["epoch"]}  |  best MPJPE {ckpt.get("best_mpjpe", "?"):.4f}')
 
@@ -192,13 +199,16 @@ def main():
                                     W_im, H_im,
                                     line_thickness=1, joint_radius=2)
 
-        fig, axes = plt.subplots(1, 2, figsize=(8, 4))
-        axes[0].imshow(vis_pred)
-        axes[0].set_title('Predicted  (green / blue)', fontsize=9)
+        fig, axes = plt.subplots(1, 3, figsize=(12, 4))
+        axes[0].imshow(img_np)
+        axes[0].set_title('Input', fontsize=9)
         axes[0].axis('off')
-        axes[1].imshow(vis_gt)
-        axes[1].set_title('GT  (orange / red)', fontsize=9)
+        axes[1].imshow(vis_pred)
+        axes[1].set_title('Predicted  (green / blue)', fontsize=9)
         axes[1].axis('off')
+        axes[2].imshow(vis_gt)
+        axes[2].set_title('GT  (orange / red)', fontsize=9)
+        axes[2].axis('off')
 
         e2d = np.linalg.norm(pred_2d_px - gt_2d, axis=-1).mean()
         e3d = np.linalg.norm(p3 - g3, axis=-1).mean()
@@ -253,6 +263,7 @@ def main():
         # instead of trying to read it from PLY (write_line_set uses a non-standard
         # 'edge' element that Open3D and other viewers silently ignore).
         viewer_lines = [
+            '# -*- coding: utf-8 -*-',
             'import argparse, numpy as np, open3d as o3d',
             'CONNECTIONS = [[0,1],[1,2],[2,3],[3,4],[0,5],[5,6],[6,7],[7,8],',
             '               [0,9],[9,10],[10,11],[11,12],[0,13],[13,14],[14,15],[15,16],',
@@ -278,7 +289,7 @@ def main():
             f'    window_name=f"3D Pose — sample {{i}}",',
             '    width=1024, height=768)',
         ]
-        with open(str(viewer_path), 'w') as f:
+        with open(str(viewer_path), 'w', encoding='utf-8') as f:
             f.write('\n'.join(viewer_lines) + '\n')
         print(f'\nTo view interactively:')
         print(f'  cd {out_dir} && python3 view_3d.py --sample {args.start_idx}')

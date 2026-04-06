@@ -279,7 +279,7 @@ def main():
         model = SDFHandPoseNet(num_kpts=21, pretrained_backbone=False)
     else:
         model = SingleViewModel(num_kpts=21)
-    ckpt  = torch.load(args.model, map_location=device)
+    ckpt  = torch.load(args.model, map_location=device, weights_only=False)
     model.load_state_dict(ckpt['model_state'])
     model = model.to(device).eval()
 
