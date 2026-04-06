@@ -6,3 +6,7 @@ __pycache__/
 
 sdf_best_model.pt
 sdf_checkpoint.pt
+visualizations/
+eval_results/
+visualizations
+eval_results
