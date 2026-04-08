@@ -5,19 +5,30 @@ realtime.py -- Live webcam hand pose estimation with sdf_best_model.pt
 Usage:
     python realtime.py
     python realtime.py --model sdf_best_model.pt --camera 0
+    python realtime.py --show-3d --K-file webcam_K.json
 
 Controls:
     Q or ESC  -- quit
     S         -- save current frame to realtime_captures/
+
+K file format (webcam_K.json):
+    {"fx": 614.3, "fy": 614.3, "cx": 320.0, "cy": 240.0}
+    or a 3x3 nested list:  [[fx,0,cx],[0,fy,cy],[0,0,1]]
+    .npy files (3x3 float array) and whitespace-delimited .txt are also accepted.
 """
 
 import argparse
+import json
 import time
 from pathlib import Path
 
 import cv2
 import numpy as np
 import torch
+
+import matplotlib
+matplotlib.use('Agg')
+import matplotlib.pyplot as plt
 
 from model_sdf import SDFHandPoseNet, IMG_SIZE
 
@@ -49,30 +60,173 @@ CONNECTIONS = [
     [0,17],[17,18],[18,19],[19,20],
 ]
 
-# BGR colors per joint (finger groups)
-JOINT_BGR = [
-    (200, 200, 200),  # 0  wrist
-    (0, 230, 0),      # 1-4  index   green
-    (0, 230, 0),
-    (0, 230, 0),
-    (0, 230, 0),
-    (255, 128, 0),    # 5-8  middle  blue
-    (255, 128, 0),
-    (255, 128, 0),
-    (255, 128, 0),
-    (0, 200, 255),    # 9-12  ring   yellow
-    (0, 200, 255),
-    (0, 200, 255),
-    (0, 200, 255),
-    (0, 100, 255),    # 13-16 pinky  orange
-    (0, 100, 255),
-    (0, 100, 255),
-    (0, 100, 255),
-    (255, 0, 230),    # 17-20 thumb  magenta
-    (255, 0, 230),
-    (255, 0, 230),
-    (180, 0, 230),
+# RGB colors per joint (finger groups) — used for both 2D and 3D drawing
+JOINT_RGB = [
+    (0.78, 0.78, 0.78),  # 0  wrist
+    (0.00, 0.90, 0.00),  # 1-4  index   green
+    (0.00, 0.90, 0.00),
+    (0.00, 0.90, 0.00),
+    (0.00, 0.90, 0.00),
+    (1.00, 0.50, 0.00),  # 5-8  middle  orange
+    (1.00, 0.50, 0.00),
+    (1.00, 0.50, 0.00),
+    (1.00, 0.50, 0.00),
+    (0.00, 0.78, 1.00),  # 9-12  ring   cyan
+    (0.00, 0.78, 1.00),
+    (0.00, 0.78, 1.00),
+    (0.00, 0.78, 1.00),
+    (0.00, 0.39, 1.00),  # 13-16 pinky  blue
+    (0.00, 0.39, 1.00),
+    (0.00, 0.39, 1.00),
+    (0.00, 0.39, 1.00),
+    (1.00, 0.00, 0.90),  # 17-20 thumb  magenta
+    (1.00, 0.00, 0.90),
+    (1.00, 0.00, 0.90),
+    (0.71, 0.00, 0.90),
 ]
+
+# BGR equivalents for OpenCV 2D drawing
+JOINT_BGR = [(int(r*255), int(g*255), int(b*255))
+             for r, g, b in [(c[2], c[1], c[0]) for c in JOINT_RGB]]
+
+
+# ---------------------------------------------------------------------------
+# Camera K helpers
+# ---------------------------------------------------------------------------
+
+def load_K(path: str) -> np.ndarray:
+    """
+    Load a 3x3 camera intrinsics matrix from:
+      - .npy  : np.load
+      - .json : {"fx","fy","cx","cy"} dict  OR  3x3 nested list
+      - .txt  : whitespace-delimited 3x3
+    Returns K as float64 (3,3).
+    """
+    p = Path(path)
+    if not p.exists():
+        raise FileNotFoundError(f'K file not found: {path}')
+    suffix = p.suffix.lower()
+    if suffix == '.npy':
+        K = np.load(str(p)).astype(np.float64)
+    elif suffix == '.json':
+        with open(p) as f:
+            data = json.load(f)
+        if isinstance(data, dict):
+            fx = data['fx']; fy = data['fy']
+            cx = data['cx']; cy = data['cy']
+            K = np.array([[fx, 0, cx], [0, fy, cy], [0, 0, 1]], dtype=np.float64)
+        else:
+            K = np.array(data, dtype=np.float64)
+    else:  # .txt or other
+        K = np.loadtxt(str(p), dtype=np.float64)
+    assert K.shape == (3, 3), f'Expected 3x3 K, got {K.shape}'
+    return K
+
+
+def adjust_K_for_crop(K: np.ndarray, x0: int, y0: int, side: int) -> np.ndarray:
+    """
+    Adjust intrinsics for a square crop starting at (x0, y0) with size `side`,
+    then resized to IMG_SIZE x IMG_SIZE.
+    """
+    scale = IMG_SIZE / side
+    K_crop = K.copy().astype(np.float64)
+    K_crop[0, 0] *= scale          # fx
+    K_crop[1, 1] *= scale          # fy
+    K_crop[0, 2] = (K[0, 2] - x0) * scale   # cx
+    K_crop[1, 2] = (K[1, 2] - y0) * scale   # cy
+    return K_crop
+
+
+# ---------------------------------------------------------------------------
+# 3D reconstruction
+# ---------------------------------------------------------------------------
+
+def reconstruct_3d(kpts_px: np.ndarray, depth_rel: np.ndarray,
+                   K_crop: np.ndarray, z_root: float,
+                   depth_scale: float) -> np.ndarray:
+    """
+    Back-project 2D keypoints + root-relative depth into 3D camera space.
+
+    Args:
+        kpts_px    : (21, 2) joint positions in IMG_SIZE pixel space
+        depth_rel  : (21,)   root-relative depth in normalised model units
+        K_crop     : (3, 3)  camera intrinsics adjusted for the crop
+        z_root     : assumed depth of the wrist joint (mm)
+        depth_scale: scale factor converting depth_rel units → mm
+
+    Returns:
+        joints_3d  : (21, 3) XYZ in camera space (mm), root-centred
+    """
+    fx = K_crop[0, 0]; fy = K_crop[1, 1]
+    cx = K_crop[0, 2]; cy = K_crop[1, 2]
+
+    # Absolute depth per joint
+    z = z_root + depth_rel * depth_scale      # (21,)
+
+    u = kpts_px[:, 0]  # (21,)
+    v = kpts_px[:, 1]
+
+    X = (u - cx) / fx * z
+    Y = (v - cy) / fy * z
+    Z = z
+
+    joints_3d = np.stack([X, Y, Z], axis=-1)  # (21, 3)
+    # Root-centre so visualisation is stable regardless of z_root assumption
+    joints_3d -= joints_3d[0:1]
+    return joints_3d
+
+
+# ---------------------------------------------------------------------------
+# 3D rendering (matplotlib Agg → numpy BGR)
+# ---------------------------------------------------------------------------
+
+def make_3d_figure(size_px: int = 400):
+    """Create a persistent matplotlib figure for 3D rendering."""
+    dpi = 100
+    fig = plt.figure(figsize=(size_px / dpi, size_px / dpi),
+                     facecolor='#111111', dpi=dpi)
+    ax = fig.add_subplot(111, projection='3d')
+    ax.set_facecolor('#111111')
+    fig.tight_layout(pad=0.5)
+    return fig, ax
+
+
+def render_3d_frame(fig, ax, joints_3d: np.ndarray) -> np.ndarray:
+    """
+    Draw the hand skeleton in 3D onto `ax`, render to a BGR numpy image.
+    joints_3d : (21, 3) root-centred XYZ
+    """
+    ax.cla()
+    ax.set_facecolor('#111111')
+
+    # Auto-range: symmetric cube centred on the data
+    r = max(np.abs(joints_3d).max() * 1.1, 50.0)
+    ax.set_xlim(-r, r); ax.set_ylim(-r, r); ax.set_zlim(-r, r)
+    ax.set_xlabel('X', color='white', fontsize=7)
+    ax.set_ylabel('Y', color='white', fontsize=7)
+    ax.set_zlabel('Z', color='white', fontsize=7)
+    ax.tick_params(colors='#888888', labelsize=6)
+    for pane in (ax.xaxis.pane, ax.yaxis.pane, ax.zaxis.pane):
+        pane.fill = False
+        pane.set_edgecolor('#333333')
+
+    # Bones
+    for s, e in CONNECTIONS:
+        xs = [joints_3d[s, 0], joints_3d[e, 0]]
+        ys = [joints_3d[s, 1], joints_3d[e, 1]]
+        zs = [joints_3d[s, 2], joints_3d[e, 2]]
+        ax.plot(xs, ys, zs, color=JOINT_RGB[s], linewidth=1.5)
+
+    # Joints
+    for k, pt in enumerate(joints_3d):
+        ax.scatter(pt[0], pt[1], pt[2],
+                   color=JOINT_RGB[k], s=18, zorder=5)
+
+    fig.canvas.draw()
+    buf = np.frombuffer(fig.canvas.tostring_rgb(), dtype=np.uint8)
+    w, h = fig.canvas.get_width_height()
+    img_rgb = buf.reshape(h, w, 3)
+    return cv2.cvtColor(img_rgb, cv2.COLOR_RGB2BGR)
 
 
 # ---------------------------------------------------------------------------
@@ -127,7 +281,7 @@ def preprocess(frame_bgr: np.ndarray,
 
 
 # ---------------------------------------------------------------------------
-# Drawing
+# 2D drawing
 # ---------------------------------------------------------------------------
 
 def draw_skeleton(canvas: np.ndarray, kpts_px: np.ndarray,
@@ -182,11 +336,19 @@ def mediapipe_hand_box(result, frame_h: int, frame_w: int) -> tuple | None:
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument('--model',    type=str, default='sdf_best_model.pt')
-    parser.add_argument('--camera',   type=int, default=0,
+    parser.add_argument('--model',       type=str, default='sdf_best_model.pt')
+    parser.add_argument('--camera',      type=int, default=0,
                         help='Webcam device index (default 0)')
-    parser.add_argument('--no-detect', action='store_true',
+    parser.add_argument('--no-detect',   action='store_true',
                         help='Disable MediaPipe hand detector, use centre-crop fallback')
+    parser.add_argument('--show-3d',     action='store_true',
+                        help='Show a second window with the 3D skeleton reconstruction')
+    parser.add_argument('--K-file',      type=str, default='webcam_K.json',
+                        help='Path to camera intrinsics file (json/npy/txt, default webcam_K.json)')
+    parser.add_argument('--z-root',      type=float, default=600.0,
+                        help='Assumed depth of the wrist in mm (default 600)')
+    parser.add_argument('--depth-scale', type=float, default=100.0,
+                        help='Scale: depth_rel model units → mm (default 100)')
     args = parser.parse_args()
 
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
@@ -222,6 +384,17 @@ def main():
         mp_hands = None
         reason = '--no-detect flag set' if args.no_detect else 'mediapipe not installed'
         print(f'MediaPipe hand detector: OFF ({reason}) — using centre-crop fallback')
+
+    # 3D visualisation setup
+    K = None
+    fig_3d = ax_3d = None
+    if args.show_3d:
+        K = load_K(args.K_file)
+        fig_3d, ax_3d = make_3d_figure(size_px=400)
+        print(f'3D view : ON  (K from {args.K_file}, z_root={args.z_root}mm, '
+              f'depth_scale={args.depth_scale})')
+    else:
+        print('3D view : OFF  (--show-3d to enable)')
     print()
 
     cap = cv2.VideoCapture(args.camera)
@@ -260,9 +433,10 @@ def main():
 
         # -- Pose inference --
         with torch.no_grad():
-            pose_2d, _, _, _ = model(inp)
+            pose_2d, depth_rel, _, _ = model(inp)
 
-        kpts = pose_2d[0].cpu().numpy()   # (21, 2) in IMG_SIZE space
+        kpts      = pose_2d[0].cpu().numpy()    # (21, 2) in IMG_SIZE space
+        depth_np  = depth_rel[0].cpu().numpy()  # (21,)
 
         # -- Map keypoints back to original frame --
         scale_x = side / IMG_SIZE
@@ -291,6 +465,14 @@ def main():
 
         cv2.imshow('Hand Pose (SDF) -- realtime', canvas)
 
+        # -- 3D visualisation --
+        if args.show_3d:
+            K_crop    = adjust_K_for_crop(K, x0, y0, side)
+            joints_3d = reconstruct_3d(kpts, depth_np, K_crop,
+                                       args.z_root, args.depth_scale)
+            img_3d    = render_3d_frame(fig_3d, ax_3d, joints_3d)
+            cv2.imshow('3D Hand Pose', img_3d)
+
         key = cv2.waitKey(1) & 0xFF
         if key in (ord('q'), 27):
             break
@@ -298,9 +480,15 @@ def main():
             fname = save_dir / f'capture_{int(time.time())}.png'
             cv2.imwrite(str(fname), canvas)
             print(f'Saved {fname}')
+            if args.show_3d:
+                fname_3d = save_dir / f'capture_{int(time.time())}_3d.png'
+                cv2.imwrite(str(fname_3d), img_3d)
+                print(f'Saved {fname_3d}')
 
     if mp_hands is not None:
         mp_hands.close()
+    if fig_3d is not None:
+        plt.close(fig_3d)
     cap.release()
     cv2.destroyAllWindows()
 
