@@ -49,10 +49,12 @@ import torchvision.models as models
 
 # ── Constants ─────────────────────────────────────────────────────────────────
 
-K        = 21      # hand keypoints
-N_PTS    = 512     # 3D query points sampled per image  (8³ = 512)
-FEAT_DIM = 256     # channel width throughout (matches backbone and model.py)
-IMG_SIZE = 128     # input / output image resolution
+K            = 21    # hand keypoints
+N_PTS        = 2048  # 3D query points sampled per image during training
+N_PTS_GRID   = 8192  # dense candidate grid at inference before SDF filtering
+N_PTS_KEEP   = 600   # nearest-surface points kept after SDF filtering (paper: 600)
+FEAT_DIM     = 256   # channel width throughout
+IMG_SIZE     = 128   # input / output image resolution
 
 
 # ── Fourier Positional Encoding ───────────────────────────────────────────────
@@ -362,28 +364,31 @@ class SDFHandPoseNet(nn.Module):
     def _sample_points(self, B: int,
                        device: torch.device) -> torch.Tensor:
         """
-        Sample N_PTS 3D query points in normalised space [-1, 1]^3.
+        Sample 3D query points in normalised space [-1, 1]^3.
 
-        Dimensions:  (u, v) — image-plane coordinates for grid_sample
-                     d      — normalised depth (root-relative)
+        Training:  N_PTS=2048 uniform random points — broad coverage gives
+                   varied SDF supervision and reduces the chance the attention
+                   head sees only empty-space points.
 
-        Training:  uniform random sampling across the full volume, giving broad
-                   coverage and varied SDF supervision signals.
-        Inference: structured 8×8×8 grid, deterministic and reproducible.
-                   (Paper uses 64³ with SDF-based filtering to select the 600
-                   nearest-surface points; the grid approach here is the
-                   lightweight equivalent for N_PTS = 8³ = 512.)
+        Inference: SDF-guided nearest-surface filtering (paper §3.2).
+                   1. Build a dense N_PTS_GRID=8192 candidate grid.
+                   2. Run a lightweight forward pass through the SDF decoder
+                      to get per-point signed distances.
+                   3. Sort by |SDF| ascending and keep N_PTS_KEEP=600 points
+                      (those closest to the predicted hand surface).
+                   This mirrors the paper's 64³ voxel grid + top-600 selection
+                   and gives the attention head much more informative points.
         """
         if self.training:
             return torch.rand(B, self.n_pts, 3, device=device) * 2 - 1
 
-        # Build a fixed 3D grid: side³ ≥ N_PTS, take first N_PTS entries
-        side = math.ceil(self.n_pts ** (1 / 3))
+        # ── Dense candidate grid ──────────────────────────────────────────
+        side = math.ceil(N_PTS_GRID ** (1 / 3))          # ≈ 21 → 21³ = 9261
         lin  = torch.linspace(-0.9, 0.9, side, device=device)
         gu, gv, gd = torch.meshgrid(lin, lin, lin, indexing='ij')
-        pts = torch.stack([gu, gv, gd], dim=-1).reshape(1, -1, 3)  # (1, side³, 3)
-        pts = pts[:, :self.n_pts].expand(B, -1, -1).contiguous()    # (B, N_PTS, 3)
-        return pts
+        grid = torch.stack([gu, gv, gd], dim=-1).reshape(1, -1, 3)  # (1, G, 3)
+        grid = grid.expand(B, -1, -1).contiguous()                   # (B, G, 3)
+        return grid    # full grid returned; SDF filtering happens in forward()
 
     # ── Forward pass ─────────────────────────────────────────────────────────
 
@@ -403,39 +408,46 @@ class SDFHandPoseNet(nn.Module):
         B = x.shape[0]
 
         # 1. Extract full-resolution pixel-aligned feature map
-        feat_map = self.backbone(x)                         # (B, 256, H, W)
+        feat_map = self.backbone(x)                              # (B, 256, H, W)
 
-        # 2. Sample 3D query points in normalised space [-1, 1]^3
-        pts = self._sample_points(B, x.device)              # (B, N, 3)
+        # 2. Sample 3D query points
+        #    Training : N_PTS=2048 random points
+        #    Inference: dense grid (N_PTS_GRID points)
+        pts = self._sample_points(B, x.device)                  # (B, N, 3)
 
-        # 3. Fourier positional encoding of the 3D coordinates
-        pos_enc = self.pos_enc(pts)                         # (B, N, 39)
+        # 3. Positional encoding + pixel-aligned features
+        pos_enc   = self.pos_enc(pts)                            # (B, N, 39)
+        img_feats = self._sample_feats(feat_map, pts[:, :, :2]) # (B, N, 256)
 
-        # 4. Pixel-aligned feature extraction
-        #    pts[:,:,:2] are (u, v) in [-1,1], directly usable by grid_sample
-        img_feats = self._sample_feats(feat_map, pts[:, :, :2])  # (B, N, 256)
+        # 4. SDF field decoder: predict signed distance per point
+        sdf_vals = self.sdf_dec(img_feats, pos_enc)             # (B, N, 1)
 
-        # 5. SDF field decoder: predict signed distance per point
-        sdf_vals = self.sdf_dec(img_feats, pos_enc)         # (B, N, 1)
+        # 5. SDF-guided nearest-surface filtering at inference  (Fix 2)
+        #    Sort all N_PTS_GRID candidates by |SDF| and keep the N_PTS_KEEP
+        #    nearest-surface points — equivalent to the paper's top-600 selection.
+        #    At training we skip this to keep gradients flowing through all points.
+        if not self.training:
+            _, keep_idx = sdf_vals.abs().squeeze(-1).sort(dim=1)  # (B, N) ascending
+            keep_idx  = keep_idx[:, :N_PTS_KEEP]                  # (B, N_PTS_KEEP)
+            idx_exp   = keep_idx.unsqueeze(-1)
+            pts       = pts.gather(1, idx_exp.expand(-1, -1, 3))
+            pos_enc   = pos_enc.gather(1, idx_exp.expand(-1, -1, pos_enc.shape[-1]))
+            img_feats = img_feats.gather(1, idx_exp.expand(-1, -1, FEAT_DIM))
+            sdf_vals  = sdf_vals.gather(1, idx_exp.expand(-1, -1, 1))
 
         # 6. Density modulation  (paper §3.2)
         #    σ = sigmoid(−|sdf|):  σ ≈ 1 near surface, σ ≈ 0 far from surface
-        density = torch.sigmoid(-sdf_vals.abs())            # (B, N, 1)
+        density = torch.sigmoid(-sdf_vals.abs())                # (B, N, 1)
 
         # 7. Feature enhancement: concat(pos_enc, img_feat, σ·img_feat) → 256-d
-        #    The density gate emphasises near-surface image features,
-        #    equivalent to the "f_enhanced = p ⊕ f_pos ⊕ (f_img · σ)" in paper.
         enhanced_raw = torch.cat(
             [pos_enc, img_feats, density * img_feats], dim=-1)  # (B, N, 551)
-        enhanced = self.feat_proj(enhanced_raw)             # (B, N, 256)
+        enhanced = self.feat_proj(enhanced_raw)                 # (B, N, 256)
 
         # 8. Attention-based joint regression
-        #    6-layer MHSA on points, then K joint queries cross-attend
-        joint_raw = self.joint_head(enhanced)               # (B, K, 3)
+        joint_raw = self.joint_head(enhanced)                   # (B, K, 3)
 
         # 9. Decode to 2.5D output format
-        #    sigmoid on (x, y) keeps predictions in (0, 1); scale to pixel space.
-        #    z_rel is left unbounded — same convention as model.py depth output.
         pose_2d   = torch.sigmoid(joint_raw[:, :, :2]) * IMG_SIZE  # (B, K, 2)
         depth_rel = joint_raw[:, :, 2]                              # (B, K)
 

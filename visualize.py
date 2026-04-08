@@ -42,7 +42,7 @@ JOINT_COLORS_NP = np.array([
     [0.0, 0.9, 0.0],   # 1  index
     [0.0, 0.9, 0.0],   # 2
     [0.0, 0.9, 0.0],   # 3
-    [0.0, 0.9, 0.0],   # 4
+    [0.0, 0.9, 0.0],   # 
     [0.0, 0.5, 1.0],   # 5  middle
     [0.0, 0.5, 1.0],   # 6
     [0.0, 0.5, 1.0],   # 7
@@ -108,9 +108,9 @@ def make_hand_lineset(joints, connections, color, o3d):
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument('--model',      type=str, required=True,
-                        help='Path to checkpoint (best_model.pt or sdf_best_model.pt)')
-    parser.add_argument('--model-type', type=str, default='heatmap',
+    parser.add_argument('--model',       type=str, required=True,
+                        help='Path to checkpoint')
+    parser.add_argument('--model-type',  type=str, default='heatmap',
                         choices=['heatmap', 'sdf'],
                         help='heatmap = SingleViewModel, sdf = SDFHandPoseNet')
     parser.add_argument('--data-root',  type=str, default='/home/kghasemz/projects/def-vislearn/kghasemz/dataset')
@@ -256,43 +256,9 @@ def main():
     if has_o3d and ply_pairs:
         print(f'PLY files saved to: {out_dir}/')
 
-    # ── Write view_3d.py convenience viewer ──────────────────────────────
     if has_o3d and ply_pairs:
-        viewer_path = out_dir / 'view_3d.py'
-        # The skeleton LineSet is rebuilt in-memory from the saved point positions
-        # instead of trying to read it from PLY (write_line_set uses a non-standard
-        # 'edge' element that Open3D and other viewers silently ignore).
-        viewer_lines = [
-            '# -*- coding: utf-8 -*-',
-            'import argparse, numpy as np, open3d as o3d',
-            'CONNECTIONS = [[0,1],[1,2],[2,3],[3,4],[0,5],[5,6],[6,7],[7,8],',
-            '               [0,9],[9,10],[10,11],[11,12],[0,13],[13,14],[14,15],[15,16],',
-            '               [0,17],[17,18],[18,19],[19,20]]',
-            'parser = argparse.ArgumentParser()',
-            f'parser.add_argument("--sample", type=int, default={args.start_idx})',
-            'args = parser.parse_args()',
-            'i = args.sample',
-            'pcd = o3d.io.read_point_cloud(f"3d_sample_{i:04d}.ply")',
-            'pts = np.asarray(pcd.points)   # (42,3): 0-20=pred, 21-41=GT',
-            'colors = np.asarray(pcd.colors)',
-            '# Rebuild LineSet in-memory — avoids non-standard PLY edge element',
-            'gt_conn = [[s+21, e+21] for s,e in CONNECTIONS]',
-            'all_conn = CONNECTIONS + gt_conn',
-            'bone_colors = [colors[s].tolist() for s,e in CONNECTIONS] + [[0.6,0.6,0.6]]*len(CONNECTIONS)',
-            'ls = o3d.geometry.LineSet()',
-            'ls.points = o3d.utility.Vector3dVector(pts)',
-            'ls.lines  = o3d.utility.Vector2iVector(np.array(all_conn, dtype=np.int32))',
-            'ls.colors = o3d.utility.Vector3dVector(np.array(bone_colors))',
-            'print(f"Sample {i}  |  LEFT=Predicted (coloured)  RIGHT=GT (grey)")',
-            'print("Controls: left-drag=rotate  scroll=zoom  right-drag=pan  Q=quit")',
-            'o3d.visualization.draw_geometries([pcd, ls],',
-            f'    window_name=f"3D Pose — sample {{i}}",',
-            '    width=1024, height=768)',
-        ]
-        with open(str(viewer_path), 'w', encoding='utf-8') as f:
-            f.write('\n'.join(viewer_lines) + '\n')
         print(f'\nTo view interactively:')
-        print(f'  cd {out_dir} && python3 view_3d.py --sample {args.start_idx}')
+        print(f'  python view_3d.py --ply-dir {out_dir} --sample {args.start_idx}')
 
 
 if __name__ == '__main__':

@@ -172,7 +172,7 @@ def main():
 
     # ── Resume from checkpoint ────────────────────────────────────────────
     if args.resume and os.path.isfile(args.resume):
-        ckpt = torch.load(args.resume, map_location=device)
+        ckpt = torch.load(args.resume, map_location=device, weights_only=False)
         model.load_state_dict(ckpt['model_state'])
         opt.load_state_dict(ckpt['optimizer_state'])
         scheduler.load_state_dict(ckpt['scheduler_state'])
