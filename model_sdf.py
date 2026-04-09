@@ -52,11 +52,12 @@ from torch.utils.checkpoint import checkpoint
 # ── Constants ─────────────────────────────────────────────────────────────────
 
 K            = 21    # hand keypoints
-N_PTS        = 2048  # 3D query points sampled per image during training
+N_PTS        = 2000  # 3D query points sampled per image during training (matches precomputed sdf_data)
 N_PTS_GRID   = 8192  # dense candidate grid at inference before SDF filtering
 N_PTS_KEEP   = 600   # nearest-surface points kept after SDF filtering (paper: 600)
 FEAT_DIM     = 256   # channel width throughout
 IMG_SIZE     = 128   # input / output image resolution
+SDF_CLAMP    = 0.15  # SDF clamping distance in metres (matches precomputed sdf_data)
 
 
 # ── Fourier Positional Encoding ───────────────────────────────────────────────
@@ -209,6 +210,7 @@ class SDFDecoder(nn.Module):
             nn.Linear(FEAT_DIM, FEAT_DIM),
             nn.ReLU(inplace=True),
             nn.Linear(FEAT_DIM, 1),
+            nn.Tanh(),  # clamp to (-1, 1); scaled by SDF_CLAMP in SDFHandPoseNet.forward
         )
 
     def forward(self, img_feats: torch.Tensor,
@@ -326,10 +328,18 @@ class SDFHandPoseNet(nn.Module):
     """
 
     def __init__(self, num_kpts: int = K, n_pts: int = N_PTS,
-                 pretrained_backbone: bool = True):
+                 pretrained_backbone: bool = True,
+                 use_sdf: bool = False):
+        """
+        use_sdf : enable SDF density gating and inference filtering.
+                  Set True only when training with --sdf-data.
+                  When False, density=1.0 (no gating) and inference uses all
+                  grid points without SDF filtering — correct for joint-only training.
+        """
         super().__init__()
         self.num_kpts = num_kpts
         self.n_pts    = n_pts
+        self.use_sdf  = use_sdf
         self._pts_buf: Optional[torch.Tensor] = None  # pre-allocated sample buffer
 
         self.backbone = ResNetUNet(pretrained=pretrained_backbone)
@@ -344,6 +354,12 @@ class SDFHandPoseNet(nn.Module):
             nn.Linear(self.pos_enc.out_dim + FEAT_DIM, FEAT_DIM),
             nn.ReLU(inplace=True),
         )
+
+        # Learnable density sharpness β — VolSDF-style surface indicator.
+        # σ(sdf) = sigmoid(sdf / β) / β
+        # As β → 0 the gate sharpens to a step function at the surface (sdf=0).
+        # Clamped to ≥ 2e-3 to prevent division instability.
+        self.density_beta = nn.Parameter(torch.tensor(0.1))
 
         self.joint_head = JointQueryAttention(
             feat_dim=FEAT_DIM, num_joints=num_kpts)
@@ -404,60 +420,70 @@ class SDFHandPoseNet(nn.Module):
 
     # ── Forward pass ─────────────────────────────────────────────────────────
 
-    def forward(self, x: torch.Tensor):
+    def forward(self, x: torch.Tensor,
+                ext_pts: Optional[torch.Tensor] = None):
         """
-        x : (B, 3, IMG_SIZE, IMG_SIZE)
+        x       : (B, 3, IMG_SIZE, IMG_SIZE)
+        ext_pts : (B, N, 3) optional precomputed query points in [-1,1]^3 model
+                  space (from sdf_data .npy files, columns 0–2).  When provided,
+                  these replace the random training sample so the SDF decoder is
+                  evaluated at the same locations as the precomputed GT SDF values.
+                  If None, N_PTS random points are sampled as usual.
 
         Returns
         -------
         pose_2d   : (B, K, 2)    2D pixel coordinates in [0, IMG_SIZE]
         depth_rel : (B, K)       root-relative scale-normalised depth
-        sdf_vals  : (B, N_PTS)   per-point signed distance predictions
-        pts       : (B, N_PTS, 3) the query points that produced sdf_vals,
-                    returned so the caller can compute SDF supervision without
-                    re-sampling (sdf_vals[i] corresponds to pts[i]).
+        sdf_vals  : (B, N)       per-point signed distance predictions in metres
+        pts       : (B, N, 3)    the query points used (ext_pts if provided)
         """
         B = x.shape[0]
 
         # 1. Extract full-resolution pixel-aligned feature map
         feat_map = self.backbone(x)                              # (B, 256, H, W)
 
-        # 2. Sample 3D query points
-        #    Training : N_PTS=2048 random points
-        #    Inference: dense grid (N_PTS_GRID points)
-        pts = self._sample_points(B, x.device)                  # (B, N, 3)
+        # 2. Query points — use precomputed ext_pts when available, else sample
+        if ext_pts is not None:
+            pts = ext_pts                                        # (B, N, 3)
+        else:
+            pts = self._sample_points(B, x.device)              # (B, N, 3)
 
         # 3. Positional encoding + pixel-aligned features
         pos_enc   = self.pos_enc(pts)                            # (B, N, 39)
         img_feats = self._sample_feats(feat_map, pts[:, :, :2]) # (B, N, 256)
 
-        # 4. SDF field decoder: predict signed distance per point
-        sdf_vals = self.sdf_dec(img_feats, pos_enc)             # (B, N, 1)
+        # 4. SDF field decoder: Tanh output in (-1, 1), scaled to metres by SDF_CLAMP.
+        #    Tanh bounds predictions to the clamping range of the GT SDF data (±0.15m),
+        #    preventing unbounded outputs that would collapse the density gate to zero.
+        sdf_tanh = self.sdf_dec(img_feats, pos_enc)             # (B, N, 1)  ∈ (-1, 1)
+        sdf_vals = sdf_tanh * SDF_CLAMP                         # (B, N, 1)  metres
 
-        # 5. SDF-guided nearest-surface filtering at inference  (Fix 2)
-        #    Sort all N_PTS_GRID candidates by |SDF| and keep the N_PTS_KEEP
-        #    nearest-surface points — equivalent to the paper's top-600 selection.
-        #    At training we skip this to keep gradients flowing through all points.
-        if not self.training:
-            _, keep_idx = sdf_vals.abs().squeeze(-1).sort(dim=1)  # (B, N) ascending
-            keep_idx  = keep_idx[:, :N_PTS_KEEP]                  # (B, N_PTS_KEEP)
+        # 5. SDF-guided nearest-surface filtering at inference (only when use_sdf=True).
+        #    Without supervised SDF, the decoder outputs are arbitrary — filtering
+        #    by them gives worse point coverage than keeping all grid points.
+        if self.use_sdf and not self.training:
+            _, keep_idx = sdf_vals.abs().squeeze(-1).sort(dim=1)
+            keep_idx  = keep_idx[:, :N_PTS_KEEP]
             idx_exp   = keep_idx.unsqueeze(-1)
             pts       = pts.gather(1, idx_exp.expand(-1, -1, 3))
             pos_enc   = pos_enc.gather(1, idx_exp.expand(-1, -1, pos_enc.shape[-1]))
             img_feats = img_feats.gather(1, idx_exp.expand(-1, -1, FEAT_DIM))
+            sdf_tanh  = sdf_tanh.gather(1, idx_exp.expand(-1, -1, 1))
             sdf_vals  = sdf_vals.gather(1, idx_exp.expand(-1, -1, 1))
 
-        # 6. Density modulation  (paper §3.2)
-        #    σ = exp(−|sdf|):  σ = 1.0 exactly on surface, σ → 0 far from surface
-        #    Using exp rather than sigmoid because our SDF is unsigned (bone-segment
-        #    distances ≥ 0).  sigmoid(-|sdf|) is bounded at 0.5 max which starves
-        #    near-surface points of feature signal.
-        density = torch.exp(-sdf_vals.abs())                    # (B, N, 1)  ∈ (0, 1]
+        # 6. Density modulation.
+        #    use_sdf=True : exp(-|sdf|/β) — peaks at 1.0 on surface, decays away.
+        #                   β is learnable, adapts surface sharpness during training.
+        #    use_sdf=False: density=1.0 — no gating, all point features pass through
+        #                   equally. Correct when SDF is unsupervised (avoids random
+        #                   corruption of img_feats before the joint attention head).
+        if self.use_sdf:
+            beta    = torch.clamp(self.density_beta, min=2e-3)
+            density = torch.exp(-sdf_vals.abs() / beta)         # (B, N, 1) ∈ (0, 1]
+        else:
+            density = torch.ones_like(sdf_vals)                 # (B, N, 1) = 1.0
 
         # 7. Feature enhancement: concat(pos_enc, σ·img_feat) → 256-d
-        #    Paper §3.2: f̃ = p̃ ⊕ σ·f_img  — density-weighted features only.
-        #    Raw img_feats are intentionally excluded so the attention head cannot
-        #    bypass the density gating.
         enhanced_raw = torch.cat(
             [pos_enc, density * img_feats], dim=-1)             # (B, N, 295)
         enhanced = self.feat_proj(enhanced_raw)                 # (B, N, 256)
