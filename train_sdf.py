@@ -4,20 +4,16 @@ train_sdf.py — Training script for SDFHandPoseNet
 Trains the HOISDF-inspired model (model_sdf.py) on the FreiHAND dataset.
 
 Usage:
-    python3 train_sdf.py --data-root /home/kghasemz/scratch/datasets/FreiHand
-    python3 train_sdf.py --data-root /home/kghasemz/scratch/datasets/FreiHand --resume sdf_checkpoint.pt
+    python3 train_sdf.py --data-root /path/to/FreiHAND
+    python3 train_sdf.py --data-root /path/to/FreiHAND --resume sdf_checkpoint.pt
 
-Differences from train.py:
-  - Imports SDFHandPoseNet from model_sdf (ResNet-50 + SDF + attention head)
-  - Model returns 3 values: (pose_2d, depth_rel, sdf_vals)
-  - No heatmap loss term (HOISDF uses direct regression, not heatmaps)
-  - Optional SDF pseudo-supervision (--sdf-weight > 0, default 0.1):
-      For each query point, the pseudo ground-truth SDF is the Euclidean
-      distance to the nearest GT joint in normalised UV image space [-1,1].
-      The model is trained to predict |sdf| ≈ nearest-joint distance, which
-      guides the density modulation toward points near the hand surface.
-      This is a lightweight proxy for the full SDF supervision in the paper,
-      which requires ground-truth signed distance fields.
+SDF supervision:
+    GT joint positions are derived on-the-fly from each batch's augmentation-
+    corrected gt_2d and gt_z tensors, converted to normalised model space
+    [-1,1]^3.  GT SDF values are then the minimum 3D distance from each query
+    point to the nearest bone segment of these joints.  Computing on-the-fly
+    ensures the SDF targets are always consistent with the augmented image the
+    model receives.  Use --gamma to control the SDF loss weight (default 0.05).
 """
 
 import argparse
@@ -32,8 +28,9 @@ from torch.amp.grad_scaler import GradScaler
 import matplotlib
 matplotlib.use('Agg')
 import matplotlib.pyplot as plt
-from torch.utils.data import DataLoader
 from tqdm import tqdm
+from torch.utils.data import DataLoader
+
 
 from model_sdf import SDFHandPoseNet
 from dataset   import FreiHANDDataset, IMG_SIZE
@@ -44,73 +41,98 @@ from model     import reconstruct_3d_from_25d
 # Loss functions
 # ============================================================================
 
-def sdf_pseudo_loss(sdf_vals: torch.Tensor,
-                    pts: torch.Tensor,
-                    gt_2d_px: torch.Tensor) -> torch.Tensor:
+BONE_SEGMENTS = [
+    (0,1),(1,2),(2,3),(3,4),
+    (0,5),(5,6),(6,7),(7,8),
+    (0,9),(9,10),(10,11),(11,12),
+    (0,13),(13,14),(14,15),(15,16),
+    (0,17),(17,18),(18,19),(19,20),
+]
+
+
+def _point_to_segment_dist(p: torch.Tensor,
+                            a: torch.Tensor,
+                            b: torch.Tensor) -> torch.Tensor:
     """
-    Lightweight SDF pseudo-supervision.
-
-    Ground-truth SDF values are approximated as the Euclidean distance from
-    each 3D query point (u, v) to the nearest GT joint (u, v), both in
-    normalised image space [-1, 1].  The depth dimension is omitted to avoid
-    scale mismatch between the [-1,1] image plane and the scale-normalised
-    depth units.
-
-    The model is supervised to predict |sdf| ≈ nearest-joint distance, which
-    trains the density gate  σ = sigmoid(−|sdf|) to be high (≈1) near joints
-    and low (≈0) far from them.
+    Minimum distance from points p to line segments a→b.
 
     Args:
-        sdf_vals  : (B, N) predicted SDF values
-        pts       : (B, N, 3) query points in [-1, 1]^3
-        gt_2d_px  : (B, K, 2) GT 2D positions in pixels [0, IMG_SIZE]
+        p : (B, N, 3)
+        a : (B, 1, 3)  segment start
+        b : (B, 1, 3)  segment end
+    Returns:
+        (B, N)  distance from each point to the nearest point on the segment
+    """
+    ab  = b - a                                      # (B, 1, 3)
+    ap  = p - a                                      # (B, N, 3)
+    denom = (ab * ab).sum(-1, keepdim=True).clamp(min=1e-8)  # (B, 1, 1)
+    t   = ((ap * ab).sum(-1, keepdim=True) / denom).clamp(0, 1)  # (B, N, 1)
+    closest = a + t * ab                             # (B, N, 3)
+    return (p - closest).norm(dim=-1)                # (B, N)
+
+
+def sdf_loss(sdf_vals: torch.Tensor,
+             pts: torch.Tensor,
+             gt_joints_norm: torch.Tensor) -> torch.Tensor:
+    """
+    SDF supervision via minimum 3D distance to the nearest hand bone segment.
+
+    GT SDF values are the distance from each query point to the nearest bone
+    segment, computed from precomputed normalised 3D joint positions
+    (sdf_joints_norm.npy).  The model is trained to predict |sdf| ≈ this
+    distance, which trains the density gate σ = sigmoid(-|sdf|) to be high
+    near the hand surface and low away from it.
+
+    Args:
+        sdf_vals       : (B, N)    predicted SDF values
+        pts            : (B, N, 3) query points in normalised [-1,1]^3 space
+        gt_joints_norm : (B, K, 3) precomputed normalised 3D joint positions
 
     Returns:
         scalar L1 loss
     """
-    # Normalise GT 2D pixel coords to [-1, 1]  (same space as pts[:,:,:2])
-    gt_uv = gt_2d_px / (IMG_SIZE / 2.0) - 1.0      # (B, K, 2)
-
-    # Distance from each query point to each GT joint (2D only)
-    pts_uv  = pts[:, :, :2]                         # (B, N, 2)
-    diff    = pts_uv.unsqueeze(2) - gt_uv.unsqueeze(1)  # (B, N, K, 2)
-    dist    = diff.norm(dim=-1)                      # (B, N, K)
-
-    # Nearest-joint distance = pseudo GT |SDF|
-    sdf_gt  = dist.min(dim=-1).values               # (B, N)  non-negative
-
+    seg_dists = []
+    for s, e in BONE_SEGMENTS:
+        a = gt_joints_norm[:, s:s+1, :]              # (B, 1, 3)
+        b = gt_joints_norm[:, e:e+1, :]              # (B, 1, 3)
+        seg_dists.append(_point_to_segment_dist(pts, a, b))  # (B, N)
+    sdf_gt = torch.stack(seg_dists, dim=-1).min(dim=-1).values  # (B, N)
     return F.l1_loss(sdf_vals.abs(), sdf_gt)
 
 
 def loss_full(pred_2d, pred_z, gt_2d, gt_z,
-              sdf_vals=None, pts=None,
-              alpha=1.0, gamma=0.1):
+              sdf_vals=None, pts=None, gt_joints_norm=None,
+              alpha=0.1, gamma=0.05):
     """
     Combined training loss for SDFHandPoseNet.
 
     Terms:
-        L_xy  : MSE on 2D pixel positions  (normalised by IMG_SIZE²)
-        L_z   : MSE on root-relative depth (normalised by 4 to match scale)
-        L_sdf : SDF pseudo-supervision     (optional, weighted by gamma)
+        L_xy  : L1 on 2D pixel positions normalised by IMG_SIZE
+                → mean absolute error as fraction of image width  (~0.02–0.15)
+        L_z   : L1 on root-relative depth in normalised units
+                → mean absolute depth error in scale-norm units  (~0.05–0.50)
+        L_sdf : L1 on predicted vs GT bone-segment SDF distances
+                → requires gt_joints_norm from precompute_sdf.py
 
     Args:
-        pred_2d   : (B, K, 2)  predicted 2D positions in pixels
-        pred_z    : (B, K)     predicted depth_rel
-        gt_2d     : (B, K, 2)  GT 2D positions in pixels
-        gt_z      : (B, K)     GT depth_rel
-        sdf_vals  : (B, N) or None
-        pts       : (B, N, 3) or None
-        alpha     : depth loss weight
-        gamma     : SDF loss weight (0 = disabled)
+        pred_2d        : (B, K, 2)  predicted 2D positions in pixels
+        pred_z         : (B, K)     predicted depth_rel
+        gt_2d          : (B, K, 2)  GT 2D positions in pixels
+        gt_z           : (B, K)     GT depth_rel
+        sdf_vals       : (B, N) or None
+        pts            : (B, N, 3) or None
+        gt_joints_norm : (B, K, 3) precomputed normalised 3D joints (required for SDF loss)
+        alpha          : depth loss weight (~0.1 balances L_z with L_xy)
+        gamma          : SDF loss weight (0 = disabled)
 
     Returns:
         total, L_xy.item(), L_z.item(), L_sdf.item()
     """
-    L_xy = F.mse_loss(pred_2d, gt_2d) / (IMG_SIZE ** 2)
-    L_z  = F.mse_loss(pred_z,  gt_z)  / 4.0
+    L_xy = F.l1_loss(pred_2d, gt_2d) / IMG_SIZE   # mean abs pixel err / 128  → ~0.02–0.15
+    L_z  = F.l1_loss(pred_z,  gt_z)               # mean abs depth err in norm units → ~0.05–0.5
 
-    if gamma > 0.0 and sdf_vals is not None and pts is not None:
-        L_sdf = sdf_pseudo_loss(sdf_vals, pts, gt_2d)
+    if gamma > 0.0 and sdf_vals is not None and pts is not None and gt_joints_norm is not None:
+        L_sdf = sdf_loss(sdf_vals, pts, gt_joints_norm)
     else:
         L_sdf = torch.zeros(1, device=pred_2d.device)[0]
 
@@ -159,10 +181,14 @@ def main():
     parser.add_argument('--epochs',       type=int,   default=150)
     parser.add_argument('--batch-size',   type=int,   default=32)
     parser.add_argument('--lr',           type=float, default=1e-4)
-    parser.add_argument('--alpha',        type=float, default=1.0,  help='Depth loss weight')
-    parser.add_argument('--gamma',        type=float, default=0.1,
-                        help='SDF pseudo-supervision weight (0 = disabled)')
+    parser.add_argument('--alpha',        type=float, default=0.1,  help='Depth loss weight — ~0.1 balances L1 depth with L1 2D/IMG_SIZE')
+    parser.add_argument('--gamma',        type=float, default=0.05,
+                        help='SDF loss weight — requires --sdf-data (0 = disabled)')
+    parser.add_argument('--freeze-backbone-epochs', type=int, default=10,
+                        help='Freeze ResNet backbone for this many epochs at start (0 = no freeze)')
     parser.add_argument('--num-workers',  type=int,   default=4)
+    parser.add_argument('--patience',      type=int,   default=20,
+                        help='Early stopping patience in epochs (0 = disabled)')
     parser.add_argument('--resume',       type=str,   default=None)
     parser.add_argument('--save-dir',     type=str,   default='.')
     parser.add_argument('--no-pretrain',  action='store_true',
@@ -180,7 +206,8 @@ def main():
     print(f'  Batch size  : {args.batch_size}')
     print(f'  LR          : {args.lr}')
     print(f'  α (depth)   : {args.alpha}')
-    print(f'  γ (SDF)     : {args.gamma}')
+    print(f'  γ (SDF)     : {args.gamma}  (on-the-fly bone-segment SDF)')
+    print(f'  Patience    : {args.patience}  (early stopping, 0=disabled)')
     print(f'  Pretrained  : {not args.no_pretrain}')
     print(f'  Device      : {args.device}')
     print(f'  Save dir    : {args.save_dir}\n')
@@ -213,7 +240,7 @@ def main():
     # Cosine annealing with 5% linear warmup (Fix 4).
     # Replaces the previous 0.7×/5-epoch exponential decay which dropped the LR
     # too aggressively, preventing the model from escaping early-training plateaus.
-    opt = optim.Adam(model.parameters(), lr=args.lr, weight_decay=1e-5)
+    opt = optim.Adam(model.parameters(), lr=args.lr, weight_decay=1e-4)
 
     total_steps  = args.epochs * len(train_loader)
     warmup_steps = max(1, int(0.05 * total_steps))   # 5% of total steps
@@ -226,8 +253,9 @@ def main():
 
     scheduler = optim.lr_scheduler.LambdaLR(opt, lr_lambda)
 
-    start_epoch = 1
-    best_mpjpe  = float('inf')
+    start_epoch    = 1
+    best_mpjpe     = float('inf')
+    epochs_no_improve = 0
     hist = {'train_loss': [], 'val_mpjpe': [], 'lr': []}
 
     # ── Resume from checkpoint ────────────────────────────────────────────
@@ -244,32 +272,55 @@ def main():
     params = sum(p.numel() for p in model.parameters())
     print(f'Model params: {params:,}  ({params * 4 / 1e6:.1f} MB)\n')
 
+    # torch.compile requires Triton which is not supported on Windows.
+    fwd_model = model
+
     scaler      = GradScaler('cuda', enabled=(device.type == 'cuda'))
     global_step = (start_epoch - 1) * len(train_loader)
 
     for epoch in range(start_epoch, args.epochs + 1):
         epoch_start = time.time()
 
+        # ── Backbone freeze / unfreeze ────────────────────────────────────
+        if args.freeze_backbone_epochs > 0:
+            freeze = (epoch <= args.freeze_backbone_epochs)
+            for p in model.backbone.parameters():
+                p.requires_grad = not freeze
+            if epoch == 1:
+                print(f'  Backbone FROZEN for first {args.freeze_backbone_epochs} epochs')
+            elif epoch == args.freeze_backbone_epochs + 1:
+                print(f'  Backbone UNFROZEN at epoch {epoch}')
+
         # ── Train ─────────────────────────────────────────────────────────
         model.train()
         train_losses = []
 
-        pbar = tqdm(train_loader, desc=f'Ep {epoch}/{args.epochs} [train]',
-                    ncols=110, leave=True)
+        pbar = tqdm(train_loader, desc=f'Ep {epoch:>3}/{args.epochs}',
+                    ncols=180, leave=False)
 
         for batch in pbar:
             imgs  = batch['image'].to(device, non_blocking=True)
             gt_2d = batch['pose_2d_gt'].to(device, non_blocking=True)
             gt_z  = batch['depth_rel_gt'].to(device, non_blocking=True)
 
+            # Derive GT joint positions in normalised model space on-the-fly.
+            # gt_2d is already augmentation-corrected by the dataset — converting
+            # here keeps SDF targets consistent with the augmented image.
+            # u,v: pixel [0, IMG_SIZE] → normalised [-1, 1]  (matches pts[:,:,:2])
+            # d  : depth_rel is already in scale-normalised units
+            u_norm = gt_2d[:, :, 0] / (IMG_SIZE / 2.0) - 1.0  # (B, K)
+            v_norm = gt_2d[:, :, 1] / (IMG_SIZE / 2.0) - 1.0  # (B, K)
+            gt_joints_norm = torch.stack([u_norm, v_norm, gt_z], dim=-1)  # (B, K, 3)
+
             opt.zero_grad(set_to_none=True)
 
             with autocast('cuda', enabled=(device.type == 'cuda')):
-                pred_2d, pred_z, sdf_vals, pts = model(imgs)
+                pred_2d, pred_z, sdf_vals, pts = fwd_model(imgs)
 
                 loss, lxy, lz, lsdf = loss_full(
                     pred_2d, pred_z, gt_2d, gt_z,
                     sdf_vals=sdf_vals, pts=pts,
+                    gt_joints_norm=gt_joints_norm,
                     alpha=args.alpha, gamma=args.gamma,
                 )
 
@@ -284,14 +335,9 @@ def main():
             train_losses.append((loss.item(), lxy, lz, lsdf))
 
             avg = np.mean(train_losses, axis=0)
-            pbar.set_postfix(
-                step=global_step,
-                loss=f'{avg[0]:.4f}',
-                xy=f'{avg[1]:.4f}',
-                z=f'{avg[2]:.4f}',
-                sdf=f'{avg[3]:.4f}',
-                lr=f'{opt.param_groups[0]["lr"]:.1e}',
-            )
+            pbar.set_postfix(loss=f'{avg[0]:.4f}', xy=f'{avg[1]:.4f}',
+                             z=f'{avg[2]:.4f}', sdf=f'{avg[3]:.4f}',
+                             lr=f'{opt.param_groups[0]["lr"]:.1e}')
 
         pbar.close()
         avg_loss, avg_lxy, avg_lz, avg_lsdf = np.mean(train_losses, axis=0)
@@ -300,21 +346,30 @@ def main():
 
         # ── Validate ──────────────────────────────────────────────────────
         print(f'  Ep {epoch} validating...', end='\r')
-        val_mpjpe = validate(model, val_loader, device)
+        val_mpjpe = validate(fwd_model, val_loader, device)
 
         hist['train_loss'].append(avg_loss)
         hist['val_mpjpe'].append(val_mpjpe)
         hist['lr'].append(current_lr)
 
+        if device.type == 'cuda':
+            mem_alloc    = torch.cuda.memory_allocated()  / 1e9
+            mem_reserved = torch.cuda.memory_reserved()   / 1e9
+            torch.cuda.empty_cache()
+            mem_str = f'  mem={mem_alloc:.1f}/{mem_reserved:.1f}GB'
+        else:
+            mem_str = ''
+
         print(f'Ep {epoch:>3}/{args.epochs}  '
               f'loss={avg_loss:.4f}  xy={avg_lxy:.4f}  z={avg_lz:.4f}  '
               f'sdf={avg_lsdf:.4f}  val_MPJPE={val_mpjpe:.4f}  '
-              f'lr={current_lr:.1e}  time={epoch_time/60:.1f}min'
+              f'lr={current_lr:.1e}  time={epoch_time/60:.1f}min{mem_str}'
               + ('  ★ best' if val_mpjpe <= min(hist['val_mpjpe']) else ''))
 
-        # ── Save best checkpoint ──────────────────────────────────────────
+        # ── Early stopping & best checkpoint ─────────────────────────────
         if val_mpjpe < best_mpjpe:
-            best_mpjpe = val_mpjpe
+            best_mpjpe        = val_mpjpe
+            epochs_no_improve = 0
             torch.save({
                 'epoch':           epoch,
                 'model_state':     model.state_dict(),
@@ -324,6 +379,12 @@ def main():
                 'history':         hist,
                 'args':            vars(args),
             }, os.path.join(args.save_dir, 'sdf_best_model.pt'))
+        else:
+            epochs_no_improve += 1
+            if args.patience > 0 and epochs_no_improve >= args.patience:
+                print(f'\nEarly stopping: no improvement for {args.patience} epochs. '
+                      f'Best val MPJPE: {best_mpjpe:.4f}')
+                break
 
         if epoch % 10 == 0:
             torch.save({
@@ -335,7 +396,7 @@ def main():
                 'history':         hist,
                 'args':            vars(args),
             }, os.path.join(args.save_dir, 'sdf_checkpoint.pt'))
-
+ 
     print(f'\nBest val MPJPE: {best_mpjpe:.4f} (normalised units)')
     print(f'Checkpoints saved to: {args.save_dir}/')
 

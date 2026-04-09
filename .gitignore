@@ -8,5 +8,6 @@ sdf_best_model.pt
 sdf_checkpoint.pt
 visualizations/
 eval_results/
-visualizations
+visualizations/
 eval_results
+models/

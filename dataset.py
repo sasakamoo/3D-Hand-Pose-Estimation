@@ -145,6 +145,7 @@ class FreiHANDDataset(Dataset):
             'K_mat':        K_t,              # (3, 3)
             'scale_factor': torch.tensor(s),  # scalar
             'xyz_raw':      xyz_raw_t,        # (K, 3) metres
+            'sample_idx':   torch.tensor(idx, dtype=torch.long),  # original FreiHAND index
         }
 
     # ── Augmentation helpers ──────────────────────────────────────────────────

@@ -41,10 +41,12 @@ Coordinate convention:
 """
 
 import math
+from typing import Optional, cast
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import torchvision.models as models
+from torch.utils.checkpoint import checkpoint
 
 
 # ── Constants ─────────────────────────────────────────────────────────────────
@@ -73,6 +75,7 @@ class FourierPosEnc(nn.Module):
         super().__init__()
         self.num_freqs = num_freqs
         freqs = 2.0 ** torch.arange(num_freqs, dtype=torch.float32)
+        self.freqs: torch.Tensor
         self.register_buffer('freqs', freqs)    # (L,)
 
     @property
@@ -134,7 +137,7 @@ class ResNetUNet(nn.Module):
             weights = models.ResNet50_Weights.DEFAULT if pretrained else None
             resnet  = models.resnet50(weights=weights)
         except AttributeError:          # older torchvision (<0.13)
-            resnet  = models.resnet50(pretrained=pretrained)
+            resnet  = models.resnet50(pretrained=pretrained)  # type: ignore[call-arg]
 
         # ── Encoder ───────────────────────────────────────────────────────
         self.stem   = nn.Sequential(resnet.conv1, resnet.bn1, resnet.relu)
@@ -167,12 +170,12 @@ class ResNetUNet(nn.Module):
         self.up = nn.Upsample(scale_factor=2, mode='bilinear', align_corners=False)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        s0 = self.stem(x)           # (B,   64,  64, 64)  ← skip for dec1
-        s1 = self.pool(s0)          # (B,   64,  32, 32)
-        e1 = self.layer1(s1)        # (B,  256,  32, 32)
-        e2 = self.layer2(e1)        # (B,  512,  16, 16)
-        e3 = self.layer3(e2)        # (B, 1024,   8,  8)
-        e4 = self.layer4(e3)        # (B, 2048,   4,  4)
+        s0 = cast(torch.Tensor, checkpoint(self.stem,   x,  use_reentrant=False))  # (B,  64, 64, 64)
+        s1 = self.pool(s0)                                                          # (B,  64, 32, 32)
+        e1 = cast(torch.Tensor, checkpoint(self.layer1, s1, use_reentrant=False))  # (B, 256, 32, 32)
+        e2 = cast(torch.Tensor, checkpoint(self.layer2, e1, use_reentrant=False))  # (B, 512, 16, 16)
+        e3 = cast(torch.Tensor, checkpoint(self.layer3, e2, use_reentrant=False))  # (B,1024,  8,  8)
+        e4 = cast(torch.Tensor, checkpoint(self.layer4, e3, use_reentrant=False))  # (B,2048,  4,  4)
 
         d = self.dec4(torch.cat([self.up(e4), e3], dim=1))  # (B, 256,   8,  8)
         d = self.dec3(torch.cat([self.up(d),  e2], dim=1))  # (B, 256,  16, 16)
@@ -196,7 +199,7 @@ class SDFDecoder(nn.Module):
     Output: scalar SDF value per point.
     """
 
-    def __init__(self, feat_dim: int = FEAT_DIM, pos_dim: int = None):
+    def __init__(self, feat_dim: int = FEAT_DIM, pos_dim: Optional[int] = None):
         super().__init__()
         if pos_dim is None:
             pos_dim = FourierPosEnc().out_dim
@@ -250,7 +253,7 @@ class JointQueryAttention(nn.Module):
                 d_model=feat_dim,
                 nhead=n_heads,
                 dim_feedforward=feat_dim * 2,
-                dropout=0.0,
+                dropout=0.1,
                 batch_first=True,
                 norm_first=True,        # pre-norm for stability
             ),
@@ -260,12 +263,13 @@ class JointQueryAttention(nn.Module):
 
         # Cross-attention: joint queries attend to encoded point features
         self.cross_attn      = nn.MultiheadAttention(
-            feat_dim, n_heads, batch_first=True, dropout=0.0)
+            feat_dim, n_heads, batch_first=True, dropout=0.1)
         self.cross_norm_q    = nn.LayerNorm(feat_dim)
         self.cross_norm_kv   = nn.LayerNorm(feat_dim)
         self.cross_ff        = nn.Sequential(
             nn.Linear(feat_dim, feat_dim * 2),
             nn.GELU(),
+            nn.Dropout(0.1),
             nn.Linear(feat_dim * 2, feat_dim),
         )
         self.cross_ff_norm   = nn.LayerNorm(feat_dim)
@@ -326,16 +330,18 @@ class SDFHandPoseNet(nn.Module):
         super().__init__()
         self.num_kpts = num_kpts
         self.n_pts    = n_pts
+        self._pts_buf: Optional[torch.Tensor] = None  # pre-allocated sample buffer
 
         self.backbone = ResNetUNet(pretrained=pretrained_backbone)
         self.pos_enc  = FourierPosEnc(num_freqs=6)
         self.sdf_dec  = SDFDecoder(feat_dim=FEAT_DIM,
                                    pos_dim=self.pos_enc.out_dim)
 
-        # Project concat(pos_enc, img_feat, σ·img_feat) → FEAT_DIM
-        # Input dim = pos_enc.out_dim + 2 × FEAT_DIM  (39 + 512 = 551)
+        # Project concat(pos_enc, σ·img_feat) → FEAT_DIM
+        # Paper §3.2: f̃ = p̃ ⊕ σ·f_img  (pos_enc + density-weighted features only)
+        # Input dim = pos_enc.out_dim + FEAT_DIM  (39 + 256 = 295)
         self.feat_proj = nn.Sequential(
-            nn.Linear(self.pos_enc.out_dim + 2 * FEAT_DIM, FEAT_DIM),
+            nn.Linear(self.pos_enc.out_dim + FEAT_DIM, FEAT_DIM),
             nn.ReLU(inplace=True),
         )
 
@@ -380,12 +386,18 @@ class SDFHandPoseNet(nn.Module):
                    and gives the attention head much more informative points.
         """
         if self.training:
-            return torch.rand(B, self.n_pts, 3, device=device) * 2 - 1
+            # Reuse a pre-allocated buffer to avoid repeated alloc/free cycles
+            # that cause CUDA memory fragmentation.
+            if self._pts_buf is None or self._pts_buf.shape[0] != B or \
+                    self._pts_buf.device != device:
+                self._pts_buf = torch.empty(B, self.n_pts, 3, device=device)
+            self._pts_buf.uniform_(-1.0, 1.0)
+            return self._pts_buf
 
         # ── Dense candidate grid ──────────────────────────────────────────
         side = math.ceil(N_PTS_GRID ** (1 / 3))          # ≈ 21 → 21³ = 9261
         lin  = torch.linspace(-0.9, 0.9, side, device=device)
-        gu, gv, gd = torch.meshgrid(lin, lin, lin, indexing='ij')
+        gu, gv, gd = torch.meshgrid(lin, lin, lin, indexing='ij')  # type: ignore[call-overload]
         grid = torch.stack([gu, gv, gd], dim=-1).reshape(1, -1, 3)  # (1, G, 3)
         grid = grid.expand(B, -1, -1).contiguous()                   # (B, G, 3)
         return grid    # full grid returned; SDF filtering happens in forward()
@@ -436,12 +448,18 @@ class SDFHandPoseNet(nn.Module):
             sdf_vals  = sdf_vals.gather(1, idx_exp.expand(-1, -1, 1))
 
         # 6. Density modulation  (paper §3.2)
-        #    σ = sigmoid(−|sdf|):  σ ≈ 1 near surface, σ ≈ 0 far from surface
-        density = torch.sigmoid(-sdf_vals.abs())                # (B, N, 1)
+        #    σ = exp(−|sdf|):  σ = 1.0 exactly on surface, σ → 0 far from surface
+        #    Using exp rather than sigmoid because our SDF is unsigned (bone-segment
+        #    distances ≥ 0).  sigmoid(-|sdf|) is bounded at 0.5 max which starves
+        #    near-surface points of feature signal.
+        density = torch.exp(-sdf_vals.abs())                    # (B, N, 1)  ∈ (0, 1]
 
-        # 7. Feature enhancement: concat(pos_enc, img_feat, σ·img_feat) → 256-d
+        # 7. Feature enhancement: concat(pos_enc, σ·img_feat) → 256-d
+        #    Paper §3.2: f̃ = p̃ ⊕ σ·f_img  — density-weighted features only.
+        #    Raw img_feats are intentionally excluded so the attention head cannot
+        #    bypass the density gating.
         enhanced_raw = torch.cat(
-            [pos_enc, img_feats, density * img_feats], dim=-1)  # (B, N, 551)
+            [pos_enc, density * img_feats], dim=-1)             # (B, N, 295)
         enhanced = self.feat_proj(enhanced_raw)                 # (B, N, 256)
 
         # 8. Attention-based joint regression
@@ -466,5 +484,5 @@ if __name__ == '__main__':
         p2d, dz, sdf, pts = net(x)
     print(f'pose_2d   : {p2d.shape}')   # (2, 21, 2)
     print(f'depth_rel : {dz.shape}')    # (2, 21)
-    print(f'sdf_vals  : {sdf.shape}')   # (2, 512)
-    print(f'pts       : {pts.shape}')   # (2, 512, 3)
+    print(f'sdf_vals  : {sdf.shape}')   # (2, N_PTS_KEEP) at inference, (2, N_PTS) at train
+    print(f'pts       : {pts.shape}')   # same
