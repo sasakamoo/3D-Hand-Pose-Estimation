@@ -1,7 +1,0 @@
-{
-  "permissions": {
-    "allow": [
-      "Read(//tmp/hoisdf_repo/common/**)"
-    ]
-  }
-}
