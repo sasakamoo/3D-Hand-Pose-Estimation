@@ -30,7 +30,9 @@ import matplotlib
 matplotlib.use('Agg')
 import matplotlib.pyplot as plt
 
-from model_sdf import SDFHandPoseNet, IMG_SIZE
+from model_sdf    import SDFHandPoseNet, IMG_SIZE, N_PTS
+from model        import SingleViewModel
+from model_hybrid import HybridHandPoseNet
 
 # MediaPipe HandLandmarker — BlazePalm detector (~8 MB .task file).
 # Runs at 60+ FPS on CPU in VIDEO mode (tracks across frames).
@@ -337,6 +339,9 @@ def mediapipe_hand_box(result, frame_h: int, frame_w: int) -> tuple | None:
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument('--model',       type=str, default='sdf_best_model.pt')
+    parser.add_argument('--model-type',  type=str, default='sdf',
+                        choices=['heatmap', 'sdf', 'hybrid'],
+                        help='Model architecture (default: sdf)')
     parser.add_argument('--camera',      type=int, default=0,
                         help='Webcam device index (default 0)')
     parser.add_argument('--no-detect',   action='store_true',
@@ -352,19 +357,29 @@ def main():
     args = parser.parse_args()
 
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-    print(f'Device : {device}')
+    print(f'Device     : {device}')
+    print(f'Model type : {args.model_type}')
 
     # Load pose model
     print(f'Loading {args.model} ...')
-    model = SDFHandPoseNet(num_kpts=21, pretrained_backbone=False)
-    ckpt  = torch.load(args.model, map_location=device, weights_only=False)
+    if args.model_type == 'sdf':
+        model = SDFHandPoseNet(num_kpts=21, pretrained_backbone=False)
+    elif args.model_type == 'hybrid':
+        model = HybridHandPoseNet(num_kpts=21, pretrained_backbone=False)
+    else:
+        model = SingleViewModel(num_kpts=21)
+    ckpt = torch.load(args.model, map_location=device, weights_only=False)
     model.load_state_dict(ckpt['model_state'])
     model = model.to(device).eval()
     print('Model ready.')
 
-    # Warmup
+    # Warmup — use ext_pts for SDF to avoid slow dense grid
     with torch.no_grad():
-        model(torch.zeros(1, 3, IMG_SIZE, IMG_SIZE, device=device))
+        dummy = torch.zeros(1, 3, IMG_SIZE, IMG_SIZE, device=device)
+        if args.model_type == 'sdf':
+            model(dummy, ext_pts=torch.zeros(1, N_PTS, 3, device=device))
+        else:
+            model(dummy)
 
     # MediaPipe hand detector
     use_detector = HAS_MEDIAPIPE and not args.no_detect
@@ -433,7 +448,13 @@ def main():
 
         # -- Pose inference --
         with torch.no_grad():
-            pose_2d, depth_rel, _, _ = model(inp)
+            if args.model_type == 'sdf':
+                ext_pts = torch.empty(1, N_PTS, 3, device=device).uniform_(-1., 1.)
+                pose_2d, depth_rel, _, _ = model(inp, ext_pts=ext_pts)
+            elif args.model_type == 'hybrid':
+                pose_2d, depth_rel, _, _, _ = model(inp)
+            else:
+                pose_2d, depth_rel, _, _ = model(inp)
 
         kpts      = pose_2d[0].cpu().numpy()    # (21, 2) in IMG_SIZE space
         depth_np  = depth_rel[0].cpu().numpy()  # (21,)
@@ -457,13 +478,13 @@ def main():
         fps = np.mean(fps_buf)
 
         # -- Overlay text --
-        det_label = 'BlazePalm+SDF' if use_detector else 'SDF (no detector)'
+        det_label = f'BlazePalm+{args.model_type.upper()}' if use_detector else f'{args.model_type.upper()} (no detector)'
         cv2.putText(canvas, f'FPS: {fps:.1f}  [{det_label}]', (10, 28),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2, cv2.LINE_AA)
         cv2.putText(canvas, 'Q/ESC=quit  S=save', (10, 56),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.55, (200, 200, 200), 1, cv2.LINE_AA)
 
-        cv2.imshow('Hand Pose (SDF) -- realtime', canvas)
+        cv2.imshow(f'Hand Pose ({args.model_type.upper()}) -- realtime', canvas)
 
         # -- 3D visualisation --
         if args.show_3d:
