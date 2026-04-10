@@ -264,23 +264,28 @@ def wire_camera_sync(fig, ax_gt, ax_pred):
     fig.canvas.mpl_connect('button_release_event', _sync)
 
 
-# ── Open3D PLY export (unchanged from original) ───────────────────────────────
+# ── Open3D PLY export ─────────────────────────────────────────────────────────
+# Two separate files so view_3d.py can open them in independent camera windows.
 
 JOINT_COLORS_NP = FINGER_COLORS.copy()
 GT_COLOR_NP     = np.array([0.6, 0.6, 0.6], dtype=np.float64)
 
 
 def export_ply(p3, g3, idx, out_dir, o3d):
-    offset  = np.array([max(p3[:, 0].max() - g3[:, 0].min() + 0.2, 0.5), 0, 0])
-    g3_off  = g3 + offset
-    all_pts = np.vstack([p3, g3_off])
-    all_col = np.vstack([JOINT_COLORS_NP, np.tile(GT_COLOR_NP, (21, 1))])
-    pcd = o3d.geometry.PointCloud()
-    pcd.points = o3d.utility.Vector3dVector(all_pts)
-    pcd.colors = o3d.utility.Vector3dVector(all_col)
-    path = str(out_dir / f'3d_sample_{idx:04d}.ply')
-    o3d.io.write_point_cloud(path, pcd)
-    return path
+    """Export predicted and GT joints as two separate PLY files."""
+    def _make_pcd(pts, cols):
+        pcd = o3d.geometry.PointCloud()
+        pcd.points = o3d.utility.Vector3dVector(pts)
+        pcd.colors = o3d.utility.Vector3dVector(cols)
+        return pcd
+
+    pred_path = str(out_dir / f'3d_pred_{idx:04d}.ply')
+    gt_path   = str(out_dir / f'3d_gt_{idx:04d}.ply')
+
+    o3d.io.write_point_cloud(pred_path, _make_pcd(p3, JOINT_COLORS_NP))
+    o3d.io.write_point_cloud(gt_path,   _make_pcd(g3, np.tile(GT_COLOR_NP, (21, 1))))
+
+    return pred_path, gt_path
 
 
 # ── Main ──────────────────────────────────────────────────────────────────────
@@ -389,8 +394,8 @@ def main():
         # PLY export
         ply_tag = ''
         if has_o3d:
-            ply_path = export_ply(p3, g3, idx, out_dir, o3d)
-            ply_tag  = f'  + {Path(ply_path).name}'
+            pred_ply, gt_ply = export_ply(p3, g3, idx, out_dir, o3d)
+            ply_tag = f'  + {Path(pred_ply).name} / {Path(gt_ply).name}'
 
         print(f'  [{local_i+1:>2}/{n}]  idx={idx:>5}  '
               f'2D={e2d:6.2f}px  3D={e3d:.4f} ({e3d_mm:.1f}mm)'
