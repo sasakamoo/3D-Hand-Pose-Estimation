@@ -42,9 +42,10 @@ import matplotlib.pyplot as plt
 import matplotlib.gridspec as gridspec
 
 
-from model     import SingleViewModel, reconstruct_3d_from_25d
-from model_sdf import SDFHandPoseNet, N_PTS
-from dataset   import FreiHANDDataset, IMG_SIZE
+from model        import SingleViewModel, reconstruct_3d_from_25d
+from model_sdf    import SDFHandPoseNet, N_PTS
+from model_hybrid import HybridHandPoseNet
+from dataset      import FreiHANDDataset, IMG_SIZE
 
 # ── Skeleton ──────────────────────────────────────────────────────────────────
 
@@ -180,7 +181,7 @@ def draw_2d_pred(ax, img_rgb: np.ndarray, pred_px: np.ndarray):
 
 
 def make_figure(img_rgb, pred_px, gt_px, p3, g3,
-                idx, e2d, e3d):
+                idx, e2d, e3d, e3d_mm):
     """
     Build a dark-themed 4-panel figure:
       [2D GT | 2D Pred | 3D GT | 3D Pred]
@@ -221,7 +222,7 @@ def make_figure(img_rgb, pred_px, gt_px, p3, g3,
 
     # ── Title ─────────────────────────────────────────────────────────────
     fig.suptitle(
-        f'Sample {idx}  ·  2D err = {e2d:.2f} px  ·  3D MPJPE = {e3d:.4f} (norm)',
+        f'Sample {idx}  ·  2D err = {e2d:.2f} px  ·  3D MPJPE = {e3d:.4f} (norm)  /  {e3d_mm:.1f} mm',
         color='white', fontsize=11, fontweight='bold', y=0.97,
     )
 
@@ -288,7 +289,7 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument('--model',       type=str, required=True)
     parser.add_argument('--model-type',  type=str, default='sdf',
-                        choices=['heatmap', 'sdf'])
+                        choices=['heatmap', 'sdf', 'hybrid'])
     parser.add_argument('--data-root',   type=str,
                         default='/home/kghasemz/scratch/datasets/FreiHand')
     parser.add_argument('--split',       type=str, default='val',
@@ -307,6 +308,8 @@ def main():
     # ── Load model ────────────────────────────────────────────────────────
     if args.model_type == 'sdf':
         model = SDFHandPoseNet(num_kpts=21, pretrained_backbone=False)
+    elif args.model_type == 'hybrid':
+        model = HybridHandPoseNet(num_kpts=21, pretrained_backbone=False)
     else:
         model = SingleViewModel(num_kpts=21)
     ckpt  = torch.load(args.model, map_location=device, weights_only=False)
@@ -330,7 +333,7 @@ def main():
     print(f'Visualizing {n} samples  (split={args.split}, '
           f'idx {args.start_idx}–{args.start_idx + n - 1})\n')
 
-    errs_2d, errs_3d = [], []
+    errs_2d, errs_3d, errs_3d_mm = [], [], []
 
     for local_i in range(n):
         idx   = args.start_idx + local_i
@@ -344,6 +347,8 @@ def main():
             if args.model_type == 'sdf':
                 ext_pts = torch.empty(1, N_PTS, 3, device=device).uniform_(-1., 1.)
                 pred_2d, pred_z, _, _ = model(img_t, ext_pts=ext_pts)
+            elif args.model_type == 'hybrid':
+                pred_2d, pred_z, _, _, _ = model(img_t)
             else:
                 pred_2d, pred_z, _, _ = model(img_t)
 
@@ -358,14 +363,18 @@ def main():
                                      ).cpu().numpy()[0]
         p3 -= p3[0]; g3 -= g3[0]   # root-relative
 
-        e2d = float(np.linalg.norm(pred_2d_px - gt_2d, axis=-1).mean())
-        e3d = float(np.linalg.norm(p3 - g3, axis=-1).mean())
-        errs_2d.append(e2d); errs_3d.append(e3d)
+        scale_m  = float(batch['scale_factor'])   # wrist→index MCP in metres
+        e2d      = float(np.linalg.norm(pred_2d_px - gt_2d, axis=-1).mean())
+        e3d      = float(np.linalg.norm(p3 - g3, axis=-1).mean())
+        e3d_mm   = e3d * scale_m * 1000
+        errs_2d.append(e2d)
+        errs_3d.append(e3d)
+        errs_3d_mm.append(e3d_mm)
 
         img_rgb = (batch['image'].permute(1, 2, 0).numpy() * 255).astype(np.uint8)
 
         fig, ax_gt, ax_pred = make_figure(
-            img_rgb, pred_2d_px, gt_2d, p3, g3, idx, e2d, e3d,
+            img_rgb, pred_2d_px, gt_2d, p3, g3, idx, e2d, e3d, e3d_mm,
         )
 
         if args.interactive:
@@ -384,12 +393,12 @@ def main():
             ply_tag  = f'  + {Path(ply_path).name}'
 
         print(f'  [{local_i+1:>2}/{n}]  idx={idx:>5}  '
-              f'2D={e2d:6.2f}px  3D={e3d:.4f}'
+              f'2D={e2d:6.2f}px  3D={e3d:.4f} ({e3d_mm:.1f}mm)'
               + (f'  → {png_path.name}' if not args.interactive else '')
               + ply_tag)
 
     print(f'\nMean 2D err  : {np.mean(errs_2d):.3f} px')
-    print(f'Mean 3D MPJPE: {np.mean(errs_3d):.4f} (norm)')
+    print(f'Mean 3D MPJPE: {np.mean(errs_3d):.4f} (norm)  /  {np.mean(errs_3d_mm):.1f} mm')
     if not args.interactive:
         print(f'\nPNGs saved to: {out_dir}/')
     if has_o3d:
